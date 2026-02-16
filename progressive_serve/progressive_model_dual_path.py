@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 import importlib
 import threading
 import inspect
+import os
 import torch
 import torch.nn as nn
 import sys
@@ -23,7 +24,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from safetensors.torch import load_file 
 
-sys.path.insert(0, "/home/devewha/v08/Juwon/01_universal/progressive_serve")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_config import (
     get_model_type,
     get_layer_class_info,
@@ -36,7 +37,7 @@ from universal_bypass_layer import UniversalBypassLayer
 class ProgressiveModelDualPath(nn.Module):
     """
     Universal Progressive Model with Dual-Path Design
-    
+
     지원 모델:
     - LLaMA (1, 2, 3)
     - Mistral
@@ -46,7 +47,7 @@ class ProgressiveModelDualPath(nn.Module):
     - GPT-2
     - Falcon
     - 기타 Decoder-only 모델
-    
+
     핵심 아이디어:
     - 레이어는 항상 실행 (CUDA Graph topology 불변)
     - 두 경로를 모두 계산:
@@ -56,15 +57,21 @@ class ProgressiveModelDualPath(nn.Module):
       * alpha=1: Path A (레이어 통과)
       * alpha=0: Path B (직접 연결)
       * 0<alpha<1: blend
-    
+
     CUDA Graph 안전성:
     - 레이어 항상 실행 → kernel sequence 불변
     - Path A/B 둘 다 항상 계산 → topology 불변
     - Alpha blending 항상 수행 → topology 불변
     - Alpha 값만 변경 (scalar buffer) → CUDA Graph safe
     - NO .item() calls in forward → capture safe!
+
+    Partial KV Recomputation:
+    - Stage 전환 시 boundary layer 기준 KV cache 부분 재계산
+    - Boundary 이전 layer: KV-only (norm + qkv_proj + rotary + cache write)
+    - Boundary 이후 layer: full forward
+    - Prefill(eager mode)에서만 동작 → CUDA Graph 재캡처 없음
     """
-    
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -72,35 +79,51 @@ class ProgressiveModelDualPath(nn.Module):
         pruned_layer_indices: Optional[List[int]] = None,
     ):
         super().__init__()
-        
+
         config = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config
-        
+
         # Get normalized model type
         self.model_type = get_model_type(config)
-        
+
         self.initially_inactive = set(pruned_layer_indices or [])
-        
+
         # Embedding
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
-        
+
         # Decoder layers
         self.layers = nn.ModuleList()
         self._init_layers(prefix)
         self._layer_forward_mode = self._resolve_layer_forward_mode()
-        
+
         # Final norm
         self.norm = RMSNorm(
             config.hidden_size,
             eps=getattr(config, 'rms_norm_eps', 1e-6),
         )
-        
+
         self.current_adapter = None
-        
+
+        # ── Partial KV Recomputation ──
+        # layer_idx → {"output": (hidden_states_cpu, residual_cpu)}
+        self._layer_output_cache: Dict[int, Any] = {}
+        # None이면 일반 forward, 정수면 해당 layer부터 full forward
+        self._partial_recompute_boundary: Optional[int] = None
+        # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
+        self._max_cacheable_layer: Optional[int] = None
+
+        # ── Persistent GPU Buffers (CUDA graph safe) ──
+        # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
+        # Prefill (eager): 직접 실행, Decode (graph replay): 자동 실행
+        # 따라서 prefill + decode 모두에서 hidden states가 자동 누적됨
+        self._persistent_h_buffers: List[torch.Tensor] = []
+        self._persistent_r_buffers: List[torch.Tensor] = []
+        self._persistent_buffers_initialized = False
+
         print(f"✅ Initialized ProgressiveModelDualPath for: {self.model_type}")
         print(f"✅ Layer forward mode: {self._layer_forward_mode}")
     
@@ -261,9 +284,70 @@ class ProgressiveModelDualPath(nn.Module):
         return "positional"
     
     # ================================================================
+    # Persistent GPU Buffers (CUDA graph safe caching)
+    # ================================================================
+
+    def _init_persistent_buffers(self, device, dtype):
+        """
+        Persistent GPU buffer 사전 할당 (최초 forward 시 1회 호출)
+
+        CUDA graph 캡처 전에 호출되어야 함 (memory profiling 단계에서 자동 호출)
+        - index_copy_()가 CUDA graph에 캡처되려면 buffer가 먼저 존재해야 함
+        - vLLM flow: model init → weight load → memory profile(forward) → graph capture(forward)
+        - memory profile 시 최초 forward → 여기서 buffer 할당
+        """
+        if self._persistent_buffers_initialized:
+            return
+
+        max_seq_len = self.vllm_config.model_config.max_model_len
+        hidden_dim = self.config.hidden_size
+        num_layers = len(self.layers)
+
+        for _ in range(num_layers):
+            self._persistent_h_buffers.append(
+                torch.zeros(max_seq_len, hidden_dim, dtype=dtype, device=device)
+            )
+            self._persistent_r_buffers.append(
+                torch.zeros(max_seq_len, hidden_dim, dtype=dtype, device=device)
+            )
+
+        self._persistent_buffers_initialized = True
+        mem_mb = num_layers * max_seq_len * hidden_dim * 2 * 2 / (1024**2)
+        print(f"✅ Persistent GPU buffers: {num_layers} layers × {max_seq_len} seq = {mem_mb:.0f} MB")
+
+    def sync_persistent_cache(self, seq_len: int):
+        """
+        GPU persistent buffer → CPU _layer_output_cache
+
+        Stage 전환 직전에 chatbot에서 호출.
+        GPU buffer의 [0:seq_len] 구간을 CPU로 복사하여 partial recompute에 사용.
+        """
+        if not self._persistent_buffers_initialized:
+            print(f"[Cache] ⚠️ Persistent buffers not initialized")
+            return
+
+        max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
+
+        self._layer_output_cache.clear()
+        for layer_idx in range(max_layer + 1):
+            h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
+            r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
+            self._layer_output_cache[layer_idx] = {"output": (h, r)}
+
+        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
+
+    def clear_persistent_buffers(self):
+        """Persistent buffer 초기화 (warmup 데이터 제거)"""
+        with torch.inference_mode():
+            for buf in self._persistent_h_buffers:
+                buf.zero_()
+            for buf in self._persistent_r_buffers:
+                buf.zero_()
+
+    # ================================================================
     # Forward: Dual-Path Design (Universal for all decoder models)
     # ================================================================
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -273,34 +357,91 @@ class ProgressiveModelDualPath(nn.Module):
     ) -> torch.Tensor:
         """
         Forward with Dual-Path Design (Universal)
-        
+
         핵심:
         1. 레이어 항상 실행 (topology 불변)
         2. Path A/B 둘 다 계산
         3. Alpha로 선택
-        
+
+        Partial KV Recomputation:
+        - _partial_recompute_boundary가 설정되면, boundary 이전 레이어는
+          KV-only forward (norm+qkv+rotary+cache_write만), boundary 이후는 full forward
+        - 캐시된 hidden states를 사용해 boundary 이전 레이어를 빠르게 처리
+        - Prefill(eager mode)에서만 동작 → CUDA Graph 재캡처 없음
+
         CUDA Graph Safety:
         - get_alpha() returns tensor (not float!)
         - No .item() calls anywhere in forward
         - All operations on GPU tensors
-        
-        범용성:
-        - **kwargs로 유연한 인자 전달
-        - Try-except로 다양한 forward 시그니처 지원
         """
-        
+
         # Embedding
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        
+
         residual = None
-        
-        for layer_wrapper in self.layers:
+
+        # ── Partial KV Recompute Mode ──
+        boundary = self._partial_recompute_boundary
+        use_partial = (
+            boundary is not None
+            and len(self._layer_output_cache) > 0
+            and self._is_cache_compatible(hidden_states)
+        )
+
+        # 디버그: Partial recompute 시작
+        if use_partial:
+            print(f"\n[PartialRecompute] 🚀 Starting partial KV recomputation")
+            print(f"  Boundary: {boundary}")
+            print(f"  Cached layers: {len(self._layer_output_cache)}")
+            kv_only_count = 0
+            full_forward_count = 0
+
+        for layer_idx, layer_wrapper in enumerate(self.layers):
+
+            if use_partial and layer_idx < boundary:
+                # ── KV-only path: 캐시된 hidden states로 KV만 기록 ──
+
+                # 입력 결정: Layer 0은 현재 embedding, 나머지는 이전 레이어 출력
+                if layer_idx == 0:
+                    kv_input_h = hidden_states
+                    kv_input_r = residual
+                else:
+                    prev_cached = self._layer_output_cache.get(layer_idx - 1)
+                    if prev_cached is not None:
+                        kv_input_h = prev_cached["output"][0].to(hidden_states.device)
+                        kv_input_r = prev_cached["output"][1].to(hidden_states.device) if prev_cached["output"][1] is not None else None
+                    else:
+                        # Fallback: 현재 hidden states 사용
+                        kv_input_h = hidden_states
+                        kv_input_r = residual
+
+                # KV-only: norm → qkv_proj → rotary → cache_write
+                self._kv_only_forward_layer(
+                    layer_wrapper.layer,
+                    positions=positions,
+                    hidden_states=kv_input_h,
+                    residual=kv_input_r,
+                )
+
+                # 출력: 현재 레이어 캐시에서
+                cached = self._layer_output_cache.get(layer_idx)
+                if cached is not None:
+                    hidden_states = cached["output"][0].to(hidden_states.device)
+                    residual = cached["output"][1].to(hidden_states.device) if cached["output"][1] is not None else None
+
+                    # 디버그: KV-only 카운트
+                    if layer_idx == 0 or layer_idx % 5 == 0 or layer_idx == boundary - 1:
+                        print(f"  Layer {layer_idx:2d}: ✓ KV-only (cached)")
+                    kv_only_count += 1
+                    continue
+
+            # ── Normal dual-path forward ──
             # Alpha 값 (tensor, CUDA Graph safe!)
             alpha = layer_wrapper.get_alpha()  # ← Returns tensor!
-            
+
             # Path A: Layer 통과
             hidden_a, residual_a = self._call_layer_forward_fast(
                 layer_wrapper.layer,
@@ -308,15 +449,15 @@ class ProgressiveModelDualPath(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-            
+
             # Path B: 레이어 간 직접 연결 (bypass)
             hidden_b = hidden_states  # 이전 값 그대로
             residual_b = residual if residual is not None else None
-            
+
             # Alpha로 경로 선택
             # Hidden states blending (tensor operations, CUDA Graph safe!)
             hidden_states = alpha * hidden_a + (1.0 - alpha) * hidden_b
-            
+
             # Residual blending
             if residual_a is not None and residual_b is not None:
                 residual = alpha * residual_a + (1.0 - alpha) * residual_b
@@ -324,15 +465,149 @@ class ProgressiveModelDualPath(nn.Module):
                 residual = alpha * residual_a
             else:
                 residual = residual_b
-        
+
+            # ── Persistent GPU buffer에 hidden states 기록 ──
+            # index_copy_()는 in-place 연산 → CUDA graph에 캡처됨
+            # Prefill(eager): 직접 실행, Decode(graph replay): 자동 실행
+            if self._max_cacheable_layer is None or layer_idx <= self._max_cacheable_layer:
+                self._init_persistent_buffers(hidden_states.device, hidden_states.dtype)
+                self._persistent_h_buffers[layer_idx].index_copy_(0, positions, hidden_states)
+                if residual is not None:
+                    self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
+
+            # 디버그: Full forward 카운트
+            if use_partial and layer_idx >= boundary:
+                if layer_idx == boundary or layer_idx % 5 == 0 or layer_idx == len(self.layers) - 1:
+                    print(f"  Layer {layer_idx:2d}: ↻ Full forward (recompute)")
+                full_forward_count += 1
+
+        # 디버그: Partial recompute 완료 통계
+        if use_partial:
+            print(f"\n[PartialRecompute] ✅ Completed")
+            print(f"  KV-only:      {kv_only_count} layers (skipped attention+MLP)")
+            print(f"  Full forward: {full_forward_count} layers (recomputed)")
+            savings = (kv_only_count / len(self.layers)) * 100
+            print(f"  Savings:      ~{savings:.1f}% of layers optimized\n")
+
+        # Partial recompute는 1회성 (성공 여부 무관, 다음 forward부터 일반 모드)
+        if boundary is not None:
+            self._partial_recompute_boundary = None
+
         # Final residual add
         if residual is not None:
             hidden_states = hidden_states + residual
-        
+
         # Final norm
         hidden_states = self.norm(hidden_states)
-        
+
         return hidden_states
+
+    # ================================================================
+    # Partial KV Recomputation Helpers
+    # ================================================================
+
+    def _is_cache_compatible(self, current_hidden: torch.Tensor) -> bool:
+        """
+        캐시된 hidden states가 현재 입력과 호환되는지 확인
+
+        Causal attention + 동일 가중치 → 동일 입력이면 동일 hidden states
+        따라서 길이 일치만 확인하면 충분 (값 비교 불필요, CPU-GPU 전송 회피)
+        """
+        current_len = current_hidden.shape[0]
+
+        # 🔥 Decode phase (seq_len=1)는 partial recompute 불필요 → 즉시 False
+        if current_len == 1:
+            return False
+
+        if 0 not in self._layer_output_cache:
+            print(f"[CacheCheck] ❌ No cached layer 0")
+            return False
+
+        cached_len = self._layer_output_cache[0]["output"][0].shape[0]
+
+        compatible = (cached_len == current_len)
+        print(f"[CacheCheck] Cached: {cached_len} tokens, Current: {current_len} tokens → "
+              f"{'✅ Compatible' if compatible else '❌ Incompatible'}")
+        return compatible
+
+    def _kv_only_forward_layer(
+        self,
+        layer: nn.Module,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> None:
+        """
+        KV-only forward: norm → qkv_proj → rotary → write_kv_to_cache
+        Attention 연산(softmax + o_proj) 및 MLP 실행 안 함.
+
+        지원: Llama, Mistral, Qwen2, Gemma 등 self_attn 패턴 모델
+        """
+        # 1. Input layernorm
+        if hasattr(layer, 'input_layernorm'):
+            if residual is None:
+                normed = layer.input_layernorm(hidden_states)
+            else:
+                normed, _ = layer.input_layernorm(hidden_states, residual)
+        else:
+            normed = hidden_states
+
+        # 2. QKV projection + rotary + cache write
+        attn = getattr(layer, 'self_attn', None)
+        if attn is None:
+            return
+
+        # qkv_proj
+        qkv_proj = getattr(attn, 'qkv_proj', None)
+        if qkv_proj is None:
+            return
+
+        qkv, _ = qkv_proj(normed)
+
+        # Split Q, K, V
+        q_size = getattr(attn, 'q_size', None)
+        kv_size = getattr(attn, 'kv_size', None)
+        if q_size is None or kv_size is None:
+            return
+
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # Rotary embedding
+        rotary_emb = getattr(attn, 'rotary_emb', None)
+        if rotary_emb is not None:
+            q, k = rotary_emb(positions, q, k)
+
+        # Write to KV cache (skip attention computation)
+        attn_module = getattr(attn, 'attn', None)
+        if attn_module is not None and hasattr(attn_module, 'write_kv_to_cache'):
+            attn_module.write_kv_to_cache(k, v)
+
+    def set_partial_recompute(self, boundary_layer_idx: int) -> None:
+        """
+        Stage 전환 후 partial KV recomputation 모드 설정.
+        boundary_layer_idx 이전 layer는 KV-only, 이후는 full forward.
+        """
+        if boundary_layer_idx <= 0 or boundary_layer_idx >= len(self.layers):
+            print(f"[PartialRecompute] Invalid boundary {boundary_layer_idx}, "
+                  f"falling back to full recompute")
+            self._partial_recompute_boundary = None
+            return
+
+        if len(self._layer_output_cache) == 0:
+            print(f"[PartialRecompute] No cached hidden states, "
+                  f"falling back to full recompute")
+            self._partial_recompute_boundary = None
+            return
+
+        self._partial_recompute_boundary = boundary_layer_idx
+        print(f"[PartialRecompute] Boundary set at layer {boundary_layer_idx}")
+        print(f"  Layers 0-{boundary_layer_idx-1}: KV-only (cached hidden states)")
+        print(f"  Layers {boundary_layer_idx}-{len(self.layers)-1}: full forward")
+
+    def clear_hidden_cache(self) -> None:
+        """Hidden state 캐시 초기화"""
+        self._layer_output_cache.clear()
+        self._partial_recompute_boundary = None
     
     def _call_layer_forward_fast(
         self,

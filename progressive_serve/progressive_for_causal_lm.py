@@ -36,8 +36,7 @@ try:
 except ImportError:
     default_weight_loader = None
 
-sys.path.insert(0, "/home/devewha/v08/Juwon/01_universal/progressive_serve")
-# Universal Dual-Path implementation
+# Universal Dual-Path implementation (same directory, no need for sys.path)
 from progressive_model_dual_path import ProgressiveModelDualPath
 from model_config import get_model_type, get_weight_pattern
 
@@ -122,9 +121,15 @@ class ProgressiveForCausalLM(nn.Module):
 
         # Stage
         self.current_stage = stage
-        
+
         # Inactive layer tracking (for weight loading)
         self.inactive_layer_indices = set(inactive_indices)
+
+        # 초기 캐싱 범위 설정
+        max_cacheable = self._get_max_cacheable_layer()
+        self.model._max_cacheable_layer = max_cacheable
+        if max_cacheable is not None:
+            print(f"✅ Initial cache limit: layers 0-{max_cacheable}")
         
         print(f"\n{'='*60}")
         print(f"ProgressiveForCausalLM (Universal, vLLM v0.8.0 v0 engine)")
@@ -486,6 +491,44 @@ class ProgressiveForCausalLM(nn.Module):
         num = self.config.num_hidden_layers
         return list(range(int(num * 0.88), num))
 
+    def get_recompute_boundary(self, newly_activated_indices: List[int]) -> Optional[int]:
+        """
+        Partial KV recomputation을 위한 boundary layer 계산.
+
+        Returns:
+            boundary layer index (이 레이어부터 full forward 필요)
+            None이면 partial recompute 불가 (전체 recompute)
+        """
+        if not newly_activated_indices:
+            return None
+
+        # Boundary = 새로 활성화된 레이어 중 최솟값
+        # 이 레이어부터 hidden states가 변경되므로 full forward 필요
+        boundary = min(newly_activated_indices)
+
+        if boundary <= 0:
+            return None  # 첫 레이어부터 변경 → full recompute
+
+        return boundary
+
+    def _get_max_cacheable_layer(self) -> Optional[int]:
+        """
+        현재 stage에서 캐싱할 최대 레이어 인덱스 반환.
+        다음 stage의 boundary-1을 반환.
+        """
+        if self.current_stage == 1:
+            # Stage 1: Stage 2 boundary-1까지만 캐싱
+            b_indices = self._get_b_indices()
+            if b_indices:
+                return min(b_indices) - 1
+        elif self.current_stage == 2:
+            # Stage 2: Stage 3 boundary-1까지만 캐싱
+            c_indices = self._get_c_indices()
+            if c_indices:
+                return min(c_indices) - 1
+        # Stage 3 or unknown: 모든 레이어 캐싱
+        return None
+
     def prefetch_stage2(self, checkpoint_path: str) -> None:
         """Stage 2 weights를 백그라운드에서 CPU에 미리 로드. Stage 1 서빙 시작 직후 호출."""
         self.model.prefetch_weights(checkpoint_path, self._get_b_indices())
@@ -499,36 +542,72 @@ class ProgressiveForCausalLM(nn.Module):
         prefetch된 weights로 즉각 Stage 2 전환.
         디스크 I/O 없이 GPU copy + alpha 변경만 실행.
         prefetch_stage2()가 먼저 호출되어 있어야 함.
+
+        Partial KV recomputation: B 레이어들이 활성화되므로 boundary 설정
         """
+        b_indices = self._get_b_indices()
+
         success = self.model.activate_layers_instant(
-            self._get_b_indices(),
+            b_indices,
             wait_if_needed=wait_if_needed,
         )
+
         if success:
             self.current_stage = 2
             self.inactive_layer_indices = set(self._get_c_indices())
+
+            # Partial KV recomputation 설정
+            boundary = self.get_recompute_boundary(b_indices)
+            if boundary is not None:
+                self.model.set_partial_recompute(boundary)
+                print(f"[Stage2] Partial recompute enabled: boundary={boundary}")
+
+            # 캐싱 범위 설정 (Stage 3 boundary-1까지)
+            max_cacheable = self._get_max_cacheable_layer()
+            self.model._max_cacheable_layer = max_cacheable
+            if max_cacheable is not None:
+                print(f"[Stage2] Caching layers 0-{max_cacheable} (Stage 3 준비)")
+
             print(f"\n{'='*80}")
             print(f"NOW AT STAGE 2 (instant)")
             print(f"{'='*80}\n")
             self.print_status()
+
         return success
 
     def advance_to_stage3_instant(self, wait_if_needed: bool = True) -> bool:
         """
         prefetch된 weights로 즉각 Stage 3 전환.
         prefetch_stage3()가 먼저 호출되어 있어야 함.
+
+        Partial KV recomputation: C 레이어들이 활성화되므로 boundary 설정
         """
+        c_indices = self._get_c_indices()
+
         success = self.model.activate_layers_instant(
-            self._get_c_indices(),
+            c_indices,
             wait_if_needed=wait_if_needed,
         )
+
         if success:
             self.current_stage = 3
             self.inactive_layer_indices = set()
+
+            # Partial KV recomputation 설정
+            boundary = self.get_recompute_boundary(c_indices)
+            if boundary is not None:
+                self.model.set_partial_recompute(boundary)
+                print(f"[Stage3] Partial recompute enabled: boundary={boundary}")
+
+            # 캐싱 범위 설정 (Stage 3는 모든 레이어)
+            self.model._max_cacheable_layer = None
+            print(f"[Stage3] Caching all layers (final stage)")
+
             print(f"\n{'='*80}")
             print(f"NOW AT STAGE 3 - FULL MODEL (instant)")
             print(f"{'='*80}\n")
             self.print_status()
+
         return success
 
     def is_stage2_ready(self) -> bool:

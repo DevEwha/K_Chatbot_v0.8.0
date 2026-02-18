@@ -124,6 +124,9 @@ class ProgressiveModelDualPath(nn.Module):
         self._persistent_h_buffers: List[torch.Tensor] = []
         self._persistent_r_buffers: List[torch.Tensor] = []
         self._persistent_buffers_initialized = False
+        # 실제 inference 데이터가 기록된 레이어 집합
+        # clear_persistent_buffers() 후 zeros인 레이어를 캐시에 올리지 않기 위해 추적
+        self._populated_layers: set = set()
 
         print(f"✅ Initialized ProgressiveModelDualPath for: {self.model_type}")
         print(f"✅ Layer forward mode: {self._layer_forward_mode}")
@@ -330,12 +333,20 @@ class ProgressiveModelDualPath(nn.Module):
         max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
 
         self._layer_output_cache.clear()
+        synced = 0
+        skipped = 0
         for layer_idx in range(max_layer + 1):
+            if layer_idx not in self._populated_layers:
+                # 실제 inference 데이터가 없음 (zeros) → 캐시에 올리지 않음
+                skipped += 1
+                continue
             h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
             r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
             self._layer_output_cache[layer_idx] = {"output": (h, r)}
+            synced += 1
 
-        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
+        print(f"[Cache] Synced {synced} layers × {seq_len} tokens (GPU → CPU)"
+              + (f", skipped {skipped} unpopulated" if skipped else ""))
 
     def clear_persistent_buffers(self):
         """Persistent buffer 초기화 (warmup 데이터 제거)"""
@@ -344,6 +355,7 @@ class ProgressiveModelDualPath(nn.Module):
                 buf.zero_()
             for buf in self._persistent_r_buffers:
                 buf.zero_()
+        self._populated_layers.clear()
 
     # ================================================================
     # Forward: Dual-Path Design (Universal for all decoder models)
@@ -457,6 +469,7 @@ class ProgressiveModelDualPath(nn.Module):
                 self._persistent_h_buffers[layer_idx].index_copy_(0, positions, hidden_states)
                 if residual is not None:
                     self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
+                self._populated_layers.add(layer_idx)
 
             # 디버그: Full forward 카운트
             if use_partial and layer_idx >= boundary:

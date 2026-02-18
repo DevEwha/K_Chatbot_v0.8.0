@@ -9,9 +9,9 @@ Stage transitions on user command (/stage2, /stage3).
 **핵심 차이점 (vs chatbot_full_cache.py):**
 - KV Cache를 턴 사이에 유지 (재초기화 안 함)
 - Stage 전환 시에만 부분적 KV Cache 재계산:
-  * Boundary 이전 레이어: KV-only forward (norm+qkv+rotary+cache_write만)
+  * Boundary 이전 레이어: 완전 스킵 (가중치 불변 → KV cache 그대로 유효)
   * Boundary 이후 레이어: full forward (새로운 가중치로 재계산)
-- Hidden states를 캐시해서 성능 최적화
+- Hidden states CPU 캐싱으로 GPU 연산 최소화
 - CUDA Graph 재캡처 최소화 (prefill에서만 partial recompute)
 
 Usage:
@@ -71,11 +71,11 @@ class ProgressiveChatbotPartial:
     Progressive Serving 기반 대화형 챗봇 (Partial KV Cache Recomputation)
 
     핵심 기능:
-    - KV Cache 턴 간 유지 (vLLM prefix caching 활용)
+    - KV Cache 턴 간 유지 (vLLM KV 블록 재사용)
     - Stage 전환 시 부분 재계산:
-      * Unchanged layers (< boundary): KV-only (빠름)
-      * Changed layers (>= boundary): full forward (정확)
-    - Hidden states CPU 캐싱으로 GPU 메모리 절약
+      * Unchanged layers (< boundary): 완전 스킵 (GPU 연산 없음, KV cache 유효)
+      * Changed layers (>= boundary): full forward (새 가중치로 KV 재계산)
+    - Hidden states CPU 캐싱으로 GPU 연산 최소화
     """
 
     def __init__(self, model_name: str):
@@ -335,23 +335,20 @@ class ProgressiveChatbotPartial:
         Stage 전환 직후 현재 대화를 재계산하여 partial KV recompute 실행.
 
         핵심 원리:
-        - Layer 0-20의 hidden states는 Stage 1과 Stage 2에서 수학적으로 동일
-          (같은 base model 가중치, feedforward 구조)
-        - 따라서 이전 턴에서 캐싱된 Layer 0-20 hidden states를 재사용 가능!
-        - Layer 21+ 만 새 가중치로 재계산
+        - Boundary 이전 레이어는 Stage 간 가중치가 동일
+          → K, V 값이 동일 → 기존 KV cache 블록이 그대로 유효
+        - 따라서 이전 턴에서 캐싱된 hidden states를 복원하고 레이어를 완전 스킵
+        - Boundary 이후 레이어만 새 가중치로 재계산
 
         동작:
-        1. 이전 턴의 prefill에서 이미 Layer 0-20 hidden states가 캐싱됨
-        2. Stage 전환 → boundary 설정
-        3. 동일 프롬프트로 forward:
-           - Layers 0-20: KV-only (캐시된 hidden states 사용, attention/MLP 스킵)
-           - Layers 21+: Full forward (새 가중치로 계산)
-        4. KV cache 업데이트 완료
-        5. Boundary 자동 클리어 (1회성)
-
-        주의:
-        - 캐싱 로직이 "더 긴 시퀀스만 캐싱"으로 개선되어
-          decode phase에서 prefill 캐시를 덮어쓰지 않음
+        1. 이전 턴 prefill에서 GPU persistent buffer에 hidden states 누적
+        2. Stage 전환 직전 sync_persistent_cache() → CPU cache로 복사
+        3. Stage 전환 → boundary 설정
+        4. 동일 프롬프트로 forward:
+           - Layers 0~boundary-1: 완전 스킵 (CPU cache에서 hidden states 복원, GPU 연산 없음)
+           - Layers boundary~: Full forward (새 가중치로 KV 재계산)
+        5. KV cache 업데이트 완료
+        6. Boundary 자동 클리어 (1회성)
         """
         if len(self.conversation) == 0:
             print(f"  [PartialRecompute] No conversation history, skipping")

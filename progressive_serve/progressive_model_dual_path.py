@@ -651,20 +651,26 @@ class ProgressiveModelDualPath(nn.Module):
     ) -> None:
         """
         레이어 활성화: alpha 0→1 + weight 로드 (범용)
-        
+
         CUDA Graph 호환:
         - .copy_()로 in-place weight 로드
         - alpha.fill_()로 in-place alpha 업데이트
         - Topology 불변 (레이어는 계속 실행됨)
         """
+        import time
+        _total_start = time.perf_counter()
+
         print(f"\n{'='*60}")
         print(f"ACTIVATING LAYERS: {layer_indices}")
         print(f"Model Type: {self.model_type}")
         print(f"{'='*60}")
-        
+
         # Checkpoint 로드
         print(f"Loading checkpoint from: {checkpoint_path}")
+        _load_start = time.perf_counter()
         state_dict = load_file(checkpoint_path)
+        _load_time = time.perf_counter() - _load_start
+        print(f"⏱️  Disk load time: {_load_time:.4f}s")
         
         device = next(self.parameters()).device
         
@@ -695,14 +701,18 @@ class ProgressiveModelDualPath(nn.Module):
                 continue
             
             # 2. In-place weight 로드 (범용, CUDA Graph 호환!)
+            _gpu_start = time.perf_counter()
             loaded_count = self._load_layer_weights(
                 layer_wrapper.layer,
                 layer_weights,
                 weight_pattern,
                 device,
             )
-            
+            torch.cuda.synchronize()  # GPU 전송 완료 대기
+            _gpu_time = time.perf_counter() - _gpu_start
+
             print(f"  ✅ Loaded {loaded_count} weight tensors")
+            print(f"  ⏱️  CPU→GPU transfer time: {_gpu_time:.4f}s")
             
             # 3. Alpha 활성화 (0 → 1)
             layer_wrapper.activate()
@@ -712,9 +722,12 @@ class ProgressiveModelDualPath(nn.Module):
             
             print(f"  ✅ Layer {layer_idx} activated!")
         
+        _total_time = time.perf_counter() - _total_start
+
         print(f"\n{'='*60}")
         print(f"LAYER ACTIVATION COMPLETE")
         print(f"Inactive layers: {self.count_inactive_layers()}")
+        print(f"⏱️  Total activation time: {_total_time:.4f}s")
         print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음")
         print(f"{'='*60}\n")
     
@@ -746,17 +759,74 @@ class ProgressiveModelDualPath(nn.Module):
         self._prefetch_path = checkpoint_path
         self._prefetch_event = threading.Event()
 
+        weight_pattern = get_weight_pattern(self.model_type)
+
         def _worker():
             try:
                 print(f"[Prefetch] Loading {checkpoint_path} in background...")
                 state_dict = load_file(checkpoint_path)
-                self._prefetch_buffer = state_dict
-                print(f"[Prefetch] ✅ {len(state_dict)} tensors ready in CPU memory")
+
+                # 방법 2: 레이어별로 fused + pinned 텐서 미리 준비
+                # instant에서는 copy_만 하면 됨 (cat/pin_memory 불필요)
+                print(f"[Prefetch] Preparing fused+pinned tensors...")
+                ready_buffer = {}  # layer_idx → {param_name: pinned_tensor}
+
+                for layer_idx in layer_indices:
+                    layer_prefix = f"model.layers.{layer_idx}."
+                    layer_weights = {
+                        k.replace(layer_prefix, ""): v
+                        for k, v in state_dict.items()
+                        if k.startswith(layer_prefix)
+                    }
+                    if not layer_weights:
+                        continue
+
+                    layer_wrapper = self.layers[layer_idx]
+                    param_tensors = {}
+
+                    for name, param in layer_wrapper.layer.named_parameters():
+                        # QKV fusion
+                        if weight_pattern.qkv_fused_name and weight_pattern.qkv_fused_name in name:
+                            weight_names = []
+                            for proj_name in weight_pattern.qkv_weights:
+                                base_path = name.replace(f".{weight_pattern.qkv_fused_name}.weight", "")
+                                wn = f"{base_path}.{proj_name}.weight".lstrip('.')
+                                weight_names.append(wn)
+                            if all(wn in layer_weights for wn in weight_names):
+                                fused = torch.cat([layer_weights[wn] for wn in weight_names], dim=0)
+                                param_tensors[name] = fused.pin_memory()
+                            continue
+
+                        # MLP fusion
+                        if weight_pattern.mlp_fused_name and weight_pattern.mlp_fused_name in name:
+                            if weight_pattern.mlp_gate_up:
+                                weight_names = []
+                                for proj_name in weight_pattern.mlp_gate_up:
+                                    base_path = name.replace(f".{weight_pattern.mlp_fused_name}.weight", "")
+                                    wn = f"{base_path}.{proj_name}.weight".lstrip('.')
+                                    weight_names.append(wn)
+                                if all(wn in layer_weights for wn in weight_names):
+                                    fused = torch.cat([layer_weights[wn] for wn in weight_names], dim=0)
+                                    param_tensors[name] = fused.pin_memory()
+                            continue
+
+                        # 일반 weight
+                        if name in layer_weights:
+                            param_tensors[name] = layer_weights[name].pin_memory()
+
+                    ready_buffer[layer_idx] = param_tensors
+
+                self._prefetch_buffer = ready_buffer
+                self._prefetch_mode = "fused_pinned"
+                total_tensors = sum(len(v) for v in ready_buffer.values())
+                print(f"[Prefetch] ✅ {total_tensors} fused+pinned tensors ready ({len(ready_buffer)} layers)")
             except Exception as e:
                 print(f"[Prefetch] ❌ Failed: {e}")
+                import traceback
+                traceback.print_exc()
                 self._prefetch_buffer = None
             finally:
-                self._prefetch_event.set()  # 예외가 나도 반드시 set
+                self._prefetch_event.set()
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
@@ -795,49 +865,74 @@ class ProgressiveModelDualPath(nn.Module):
                 f"requested={layer_indices}"
             )
 
-        state_dict = self._prefetch_buffer
+        buffer = self._prefetch_buffer
         device = next(self.parameters()).device
-        weight_pattern = get_weight_pattern(self.model_type)
+        is_fused_pinned = getattr(self, '_prefetch_mode', None) == "fused_pinned"
 
         print(f"\n{'='*60}")
         print(f"INSTANT ACTIVATION: {layer_indices}")
+        if is_fused_pinned:
+            print(f"Mode: fused+pinned (GPU copy only)")
         print(f"{'='*60}")
 
         try:
-            for layer_idx in layer_indices:
-                layer_wrapper = self.layers[layer_idx]
+            if is_fused_pinned:
+                # 방법 2: fused+pinned 텐서에서 직접 GPU copy
+                for layer_idx in layer_indices:
+                    layer_wrapper = self.layers[layer_idx]
+                    if layer_wrapper.is_active():
+                        print(f"  Layer {layer_idx}: already active")
+                        continue
 
-                if layer_wrapper.is_active():
-                    print(f"  Layer {layer_idx}: already active")
-                    continue
+                    if layer_idx not in buffer:
+                        print(f"  ⚠️ No weights for layer {layer_idx}")
+                        continue
 
-                layer_prefix = f"model.layers.{layer_idx}."
-                layer_weights = {
-                    k.replace(layer_prefix, ""): v
-                    for k, v in state_dict.items()
-                    if k.startswith(layer_prefix)
-                }
+                    param_tensors = buffer[layer_idx]
+                    loaded = 0
+                    for name, param in layer_wrapper.layer.named_parameters():
+                        if name in param_tensors:
+                            param.data.copy_(param_tensors[name].to(device, non_blocking=True))
+                            loaded += 1
+                    torch.cuda.synchronize()
 
-                if not layer_weights:
-                    print(f"  ⚠️ No weights for layer {layer_idx}")
-                    continue
+                    print(f"  ✅ Layer {layer_idx}: {loaded} tensors → GPU (pinned→DMA)")
+                    layer_wrapper.activate()
+                    self.initially_inactive.discard(layer_idx)
+            else:
+                # 기존 방식: state_dict에서 로드
+                weight_pattern = get_weight_pattern(self.model_type)
+                for layer_idx in layer_indices:
+                    layer_wrapper = self.layers[layer_idx]
+                    if layer_wrapper.is_active():
+                        print(f"  Layer {layer_idx}: already active")
+                        continue
 
-                loaded = self._load_layer_weights(
-                    layer_wrapper.layer, layer_weights, weight_pattern, device
-                )
-                print(f"  ✅ Layer {layer_idx}: {loaded} tensors → GPU")
+                    layer_prefix = f"model.layers.{layer_idx}."
+                    layer_weights = {
+                        k.replace(layer_prefix, ""): v
+                        for k, v in buffer.items()
+                        if k.startswith(layer_prefix)
+                    }
+                    if not layer_weights:
+                        print(f"  ⚠️ No weights for layer {layer_idx}")
+                        continue
 
-                layer_wrapper.activate()
-                self.initially_inactive.discard(layer_idx)
-                print(f"  ✅ Layer {layer_idx} activated (alpha 0→1)")
+                    loaded = self._load_layer_weights(
+                        layer_wrapper.layer, layer_weights, weight_pattern, device
+                    )
+                    print(f"  ✅ Layer {layer_idx}: {loaded} tensors → GPU")
+                    layer_wrapper.activate()
+                    self.initially_inactive.discard(layer_idx)
 
             print(f"\n✅ Instant activation complete")
             print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음\n")
             return True
 
         finally:
-            # 성공/실패 관계없이 전체 prefetch 상태 정리
             self._prefetch_buffer = None
+            if hasattr(self, '_prefetch_mode'):
+                del self._prefetch_mode
             if hasattr(self, '_prefetch_event'):
                 del self._prefetch_event
             if hasattr(self, '_prefetch_path'):
@@ -950,13 +1045,12 @@ class ProgressiveModelDualPath(nn.Module):
             fused_weight = torch.cat([
                 layer_weights[name] for name in weight_names
             ], dim=0)
-            
             param.data.copy_(fused_weight.to(device))
             print(f"  ✅ Loaded fused QKV ({len(weight_names)} weights)")
             return True
-        
+
         return False
-    
+
     def _load_mlp_fused(
         self,
         param,
@@ -982,7 +1076,6 @@ class ProgressiveModelDualPath(nn.Module):
             fused_weight = torch.cat([
                 layer_weights[name] for name in weight_names
             ], dim=0)
-            
             param.data.copy_(fused_weight.to(device))
             print(f"  ✅ Loaded fused MLP ({len(weight_names)} weights)")
             return True

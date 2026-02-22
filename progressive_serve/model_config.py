@@ -91,9 +91,9 @@ LAYER_CLASS_MAPPING: Dict[str, Dict[str, str]] = {
         "layer_class": "LlamaDecoderLayer",
     },
     "mistral": {
-        "module": "vllm.model_executor.models.mistral",
-        "v1_module": "vllm.v1.model_executor.models.mistral",
-        "layer_class": "MistralDecoderLayer",
+        "module": "vllm.model_executor.models.llama",
+        "v1_module": "vllm.v1.model_executor.models.llama",
+        "layer_class": "LlamaDecoderLayer",
     },
     "qwen2": {
         "module": "vllm.model_executor.models.qwen2",

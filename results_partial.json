@@ -1,0 +1,76 @@
+{
+  "mode": "partial",
+  "model": "llama",
+  "t_load_s": 26.33,
+  "gpu_mem_after_load_gb": 18.381,
+  "stage1_chats": [
+    {
+      "question": "Tell me about the history of computing briefly.",
+      "t_chat_s": 5.666,
+      "n_input_tokens": 18,
+      "n_gen_tokens": 255,
+      "tokens_per_sec": 45.0,
+      "gpu_mem_gb": 18.381
+    },
+    {
+      "question": "What were the key innovations of the 1970s in computing?",
+      "t_chat_s": 5.767,
+      "n_input_tokens": 299,
+      "n_gen_tokens": 255,
+      "tokens_per_sec": 44.2,
+      "gpu_mem_gb": 18.381
+    },
+    {
+      "question": "How did personal computers change society?",
+      "t_chat_s": 5.869,
+      "n_input_tokens": 570,
+      "n_gen_tokens": 257,
+      "tokens_per_sec": 43.8,
+      "gpu_mem_gb": 18.381
+    }
+  ],
+  "stage1_to_2": {
+    "t_sync_s": 0.202,
+    "t_prefetch_s": 0.004,
+    "t_activation_s": 0.679,
+    "t_recompute_s": 0.119,
+    "t_total_transition_s": 1.004,
+    "gpu_mem_after_transition_gb": 18.381,
+    "t_first_chat_s": 4.546,
+    "first_chat_n_input": 844,
+    "first_chat_n_gen": 193,
+    "t_total_effective_s": 5.55
+  },
+  "stage2_chats": [
+    {
+      "question": "Can you explain neural networks briefly?",
+      "t_chat_s": 6.037,
+      "n_input_tokens": 1053,
+      "n_gen_tokens": 256,
+      "tokens_per_sec": 42.4,
+      "gpu_mem_gb": 18.381
+    }
+  ],
+  "stage2_to_3": {
+    "t_sync_s": 0.422,
+    "t_prefetch_s": 0.005,
+    "t_activation_s": 0.646,
+    "t_recompute_s": 0.211,
+    "t_total_transition_s": 1.284,
+    "gpu_mem_after_transition_gb": 18.381,
+    "t_first_chat_s": 6.157,
+    "first_chat_n_input": 1326,
+    "first_chat_n_gen": 256,
+    "t_total_effective_s": 7.441
+  },
+  "stage3_chats": [
+    {
+      "question": "How will AI affect employment in the next decade?",
+      "t_chat_s": 6.233,
+      "n_input_tokens": 1604,
+      "n_gen_tokens": 256,
+      "tokens_per_sec": 41.1,
+      "gpu_mem_gb": 18.381
+    }
+  ]
+}

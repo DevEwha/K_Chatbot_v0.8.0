@@ -116,6 +116,11 @@ class ProgressiveModelDualPath(nn.Module):
         # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
         self._max_cacheable_layer: Optional[int] = None
 
+        # ── GPU-resident Partial Recompute (Method A) ──
+        # CPU 복사 없이 GPU persistent buffer에서 직접 boundary hidden states 사용.
+        # Front layers KV cache는 그대로 유지, back layers만 재계산.
+        self._recompute_from_boundary_gpu: Optional[int] = None
+
         # ── Persistent GPU Buffers (CUDA graph safe) ──
         # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
         # Prefill (eager): 직접 실행, Decode (graph replay): 자동 실행
@@ -383,6 +388,82 @@ class ProgressiveModelDualPath(nn.Module):
 
         residual = None
 
+        # ── GPU-resident Partial Recompute (Method A) ──
+        # Front layers KV cache는 가중치 변경 없음 → 그대로 유효.
+        # _persistent_h_buffers[gpu_boundary-1]에서 boundary hidden states 직접 읽어
+        # back layers만 재계산. CPU 복사, KV-only pass 완전 제거.
+        gpu_boundary = self._recompute_from_boundary_gpu
+        if gpu_boundary is not None:
+            seq_len = hidden_states.shape[0]
+            if seq_len > 1 and self._persistent_buffers_initialized:
+                # boundary-1 레이어의 GPU 저장 hidden states 읽기
+                # positions: [seq_len] 텐서, buffer[positions] → [seq_len, hidden]
+                boundary_h = self._persistent_h_buffers[gpu_boundary - 1][positions]
+                boundary_r = self._persistent_r_buffers[gpu_boundary - 1][positions]
+
+                self._recompute_from_boundary_gpu = None  # 1회성
+
+                print(f"\n[GPURecompute] 🚀 GPU-resident partial recompute")
+                print(f"  Boundary layer : {gpu_boundary}")
+                print(f"  Front layers   : 0-{gpu_boundary-1} → skipped (KV cache already valid)")
+                print(f"  Back layers    : {gpu_boundary}-{len(self.layers)-1} → full forward")
+                print(f"  Tokens         : {seq_len}")
+
+                # Front layers 완전 스킵: 해당 attention의 write_kv_to_cache 호출 안 됨
+                # → front layer KV cache slots 그대로 유지
+                hidden_states = boundary_h
+                residual = boundary_r
+
+                # Back layers만 실행 (dual-path 그대로 유지)
+                for layer_idx in range(gpu_boundary, len(self.layers)):
+                    layer_wrapper = self.layers[layer_idx]
+
+                    alpha = layer_wrapper.get_alpha()  # tensor, CUDA Graph safe
+
+                    # Path A: Layer 통과 (attention이 내부적으로 write_kv_to_cache 호출)
+                    hidden_a, residual_a = self._call_layer_forward_fast(
+                        layer_wrapper.layer,
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                    )
+
+                    # Path B: bypass
+                    hidden_b = hidden_states
+                    residual_b = residual
+
+                    # Alpha blending
+                    hidden_states = alpha * hidden_a + (1.0 - alpha) * hidden_b
+                    if residual_a is not None and residual_b is not None:
+                        residual = alpha * residual_a + (1.0 - alpha) * residual_b
+                    elif residual_a is not None:
+                        residual = alpha * residual_a
+                    else:
+                        residual = residual_b
+
+                    # Persistent buffer 업데이트 (back layers용)
+                    if self._max_cacheable_layer is None or layer_idx <= self._max_cacheable_layer:
+                        self._persistent_h_buffers[layer_idx].index_copy_(
+                            0, positions, hidden_states)
+                        if residual is not None:
+                            self._persistent_r_buffers[layer_idx].index_copy_(
+                                0, positions, residual)
+
+                    if layer_idx == gpu_boundary or layer_idx == len(self.layers) - 1:
+                        print(f"  Layer {layer_idx:2d}: ↻ full forward (GPU-resident recompute)")
+
+                print(f"[GPURecompute] ✅ Back layers recomputed, front KV cache preserved\n")
+
+                # Final residual + norm
+                if residual is not None:
+                    hidden_states = hidden_states + residual
+                hidden_states = self.norm(hidden_states)
+                return hidden_states
+
+            else:
+                # seq_len=1 (decode phase) 이거나 버퍼 미초기화 → 모드 클리어 후 일반 forward
+                self._recompute_from_boundary_gpu = None
+
         # ── Partial KV Recompute Mode ──
         boundary = self._partial_recompute_boundary
         use_partial = (
@@ -541,24 +622,41 @@ class ProgressiveModelDualPath(nn.Module):
         KV-only forward: norm → qkv_proj → rotary → write_kv_to_cache
         Attention 연산(softmax + o_proj) 및 MLP 실행 안 함.
 
-        지원: Llama, Mistral, Qwen2, Gemma 등 self_attn 패턴 모델
+        지원: Llama/Mistral (self_attn + input_layernorm),
+              Falcon (self_attention + ln_attn + query_key_value)
         """
+        # Falcon 감지: self_attention + ln_attn 조합
+        is_falcon = hasattr(layer, 'self_attention') and hasattr(layer, 'ln_attn')
+
         # 1. Input layernorm
-        if hasattr(layer, 'input_layernorm'):
+        if is_falcon:
+            # Falcon: parallel attn/mlp 구조, ln_attn만 attention path에 적용
+            normed = layer.ln_attn(hidden_states)
+        elif hasattr(layer, 'input_layernorm'):
+            # Llama/Mistral: fused RMSNorm (hidden_states, residual) or plain call
             if residual is None:
                 normed = layer.input_layernorm(hidden_states)
             else:
-                normed, _ = layer.input_layernorm(hidden_states, residual)
+                try:
+                    normed, _ = layer.input_layernorm(hidden_states, residual)
+                except TypeError:
+                    normed = layer.input_layernorm(hidden_states)
         else:
             normed = hidden_states
 
-        # 2. QKV projection + rotary + cache write
-        attn = getattr(layer, 'self_attn', None)
+        # 2. Attention 모듈 선택
+        if is_falcon:
+            attn = layer.self_attention
+        else:
+            attn = getattr(layer, 'self_attn', None)
         if attn is None:
             return
 
-        # qkv_proj
-        qkv_proj = getattr(attn, 'qkv_proj', None)
+        # 3. QKV projection
+        if is_falcon:
+            qkv_proj = getattr(attn, 'query_key_value', None)
+        else:
+            qkv_proj = getattr(attn, 'qkv_proj', None)
         if qkv_proj is None:
             return
 
@@ -604,10 +702,39 @@ class ProgressiveModelDualPath(nn.Module):
         print(f"  Layers 0-{boundary_layer_idx-1}: KV-only (cached hidden states)")
         print(f"  Layers {boundary_layer_idx}-{len(self.layers)-1}: full forward")
 
+    def set_recompute_from_boundary_gpu(self, boundary_layer_idx: int) -> bool:
+        """
+        GPU-resident partial recompute 모드 설정 (Method A).
+
+        Stage 전환 후 호출. Front layers KV cache는 가중치 변경 없으므로 유효.
+        _persistent_h_buffers[boundary-1]에서 boundary hidden states를 직접 읽어
+        back layers만 재계산. CPU 복사 없음, KV-only pass 없음.
+
+        Returns:
+            True: 모드 설정 성공
+            False: 버퍼 미초기화 등으로 설정 불가 (일반 forward로 진행됨)
+        """
+        if boundary_layer_idx <= 0 or boundary_layer_idx >= len(self.layers):
+            print(f"[GPURecompute] Invalid boundary {boundary_layer_idx} "
+                  f"(layers: {len(self.layers)}), GPU mode not set")
+            return False
+
+        if not self._persistent_buffers_initialized:
+            print(f"[GPURecompute] Persistent buffers not initialized yet, "
+                  f"GPU mode not available")
+            return False
+
+        self._recompute_from_boundary_gpu = boundary_layer_idx
+        print(f"[GPURecompute] ✅ GPU-resident mode set: boundary={boundary_layer_idx}")
+        print(f"  Front layers 0-{boundary_layer_idx-1}: skipped (KV cache already valid)")
+        print(f"  Back layers {boundary_layer_idx}-{len(self.layers)-1}: full forward")
+        return True
+
     def clear_hidden_cache(self) -> None:
         """Hidden state 캐시 초기화"""
         self._layer_output_cache.clear()
         self._partial_recompute_boundary = None
+        self._recompute_from_boundary_gpu = None
     
     def _call_layer_forward_fast(
         self,

@@ -17,15 +17,20 @@ Usage:
   python benchmark_chatbots.py --compare results_origin.json results_partial.json
 
 측정 항목:
-  [Origin]  t_prefetch | t_activation | t_cache_clear
-            → t_total_transition (빠름)
-            → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
-            → t_total_effective = transition + first_chat
+  [Origin]   t_prefetch | t_activation | t_cache_clear
+             → t_total_transition (빠름)
+             → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
+             → t_total_effective = transition + first_chat
 
-  [Partial] t_sync | t_prefetch | t_activation | t_recompute
-            → t_total_transition (recompute 포함, 느림)
-            → t_first_chat  ← KV 이미 계산됨 (빠름)
-            → t_total_effective = transition + first_chat
+  [Partial / Method A - GPU-resident]
+             t_sync≈0 | t_prefetch | t_activation(+block_reset) | t_recompute(back-layers only)
+             → t_total_transition
+             → t_first_chat  ← KV 이미 계산됨 (빠름)
+
+  [Partial / Method B - CPU-based (legacy)]
+             t_sync | t_prefetch | t_activation | t_recompute(kv-only+back-layers)
+             → t_total_transition (recompute 포함, 느림)
+             → t_first_chat  ← KV 이미 계산됨 (빠름)
 
 핵심: t_total_effective 가 진짜 사용자 체감 비용
 """
@@ -264,8 +269,12 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     """
     Partial 모드 stage 전환 타이밍 측정.
 
-    단계: sync → prefetch → activation → recompute(partial)
+    [Method A - GPU-resident]: (block_reset) → prefetch → activation → recompute(back-layers only)
+    [Method B - CPU-based]:    sync → prefetch → activation → recompute(kv-only+back-layers)
     이후: 첫 채팅 (KV 이미 계산됨 → 빠름)
+
+    Method A 감지 기준: model.model._persistent_buffers_initialized == True
+                       AND model.model.set_recompute_from_boundary_gpu 존재
     """
     tr = {}
     checkpoint_path = config[stage_key]
@@ -275,15 +284,31 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     advance_fn  = getattr(model, advance_fn_name)
     minimal_params = SamplingParams(temperature=0.0, max_tokens=1)
 
-    # t_sync: GPU persistent buffer → CPU cache 동기화
+    # Method A (GPU-resident) vs Method B (CPU-based) 감지
+    inner_model = getattr(model, "model", None)
+    use_gpu_resident = (
+        inner_model is not None
+        and hasattr(inner_model, "_persistent_buffers_initialized")
+        and inner_model._persistent_buffers_initialized
+        and hasattr(inner_model, "set_recompute_from_boundary_gpu")
+    )
+    tr["method"] = "A_gpu_resident" if use_gpu_resident else "B_cpu_based"
+    method_label = "A:GPU-only" if use_gpu_resident else "B:CPU-sync"
+    print(f"    → Recompute method: {tr['method']}")
+
+    # t_sync: [Method B] GPU persistent buffer → CPU cache 동기화
+    #         [Method A] 불필요 (GPU buffer에 이미 존재) → 0.000s 기록
     t0 = time.time()
-    if hasattr(model, "model") and hasattr(model.model, "sync_persistent_cache"):
-        prompt_now = build_prompt(tokenizer, conversation)
-        seq_len = len(tokenizer.encode(prompt_now))
-        torch.cuda.synchronize()
-        model.model.sync_persistent_cache(seq_len)
-        torch.cuda.synchronize()
-        print(f"    → sync_persistent_cache({seq_len} tokens)")
+    if not use_gpu_resident:
+        if inner_model is not None and hasattr(inner_model, "sync_persistent_cache"):
+            prompt_now = build_prompt(tokenizer, conversation)
+            seq_len = len(tokenizer.encode(prompt_now))
+            torch.cuda.synchronize()
+            inner_model.sync_persistent_cache(seq_len)
+            torch.cuda.synchronize()
+            print(f"    → [B] sync_persistent_cache({seq_len} tokens)")
+    else:
+        print(f"    → [A] No CPU sync needed (GPU-resident buffers)")
     tr["t_sync_s"] = round(time.time() - t0, 3)
 
     # t_prefetch: checkpoint CPU 로드 + 대기
@@ -295,17 +320,29 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     tr["t_prefetch_s"] = round(time.time() - t0, 3)
 
     # t_activation: GPU weight copy + boundary 설정
+    # [Method A] advance_fn 이후 block computed 리셋 포함:
+    #   → prefix caching이 context_len=0으로 판단 → 전체 토큰 fresh prefill
+    #   → front layers forward 스킵 (KV 유지), back layers GPU buffer에서 재계산
     torch.cuda.synchronize()
     t0 = time.time()
     ok = advance_fn(wait_if_needed=False)
+    if use_gpu_resident:
+        # benchmark는 chatbot_partial_cache.py를 거치지 않으므로 직접 block reset
+        engine = llm.llm_engine
+        if hasattr(engine, 'scheduler') and engine.scheduler:
+            block_manager = engine.scheduler[0].block_manager
+            if hasattr(block_manager, 'mark_all_blocks_as_uncomputed'):
+                block_manager.mark_all_blocks_as_uncomputed()
+                print(f"    → [A] All KV blocks marked as uncomputed (forcing fresh prefill)")
     torch.cuda.synchronize()
     tr["t_activation_s"] = round(time.time() - t0, 3)
     if not ok:
         raise RuntimeError(f"{advance_fn_name} returned False")
 
     # t_recompute: partial recompute (generate max_tokens=1)
-    # - boundary 이전 레이어: KV-only (캐시된 hidden states 사용, 빠름)
-    # - boundary 이후 레이어: full forward (새 가중치, 정확)
+    # [Method A] back-layers only: GPU buffer에서 boundary hidden states 직접 사용
+    #            front KV cache 유지, CPU↔GPU 전송 없음
+    # [Method B] KV-only pass(front layers) + full forward(back layers)
     torch.cuda.synchronize()
     t0 = time.time()
     if len(conversation) > 0:
@@ -319,7 +356,7 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     )
     tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
 
-    print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
+    print(f"    → [{method_label}] t_sync={tr['t_sync_s']:.3f}s | "
           f"t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
           f"t_recompute={tr['t_recompute_s']:.3f}s | "
@@ -470,8 +507,10 @@ def run_partial(model_name: str, output_path: str):
     """
     Partial 모드 벤치마크.
 
-    Stage 전환: GPU buffer sync → prefetch → activation → partial recompute
+    Stage 전환 [Method A - GPU-resident]: prefetch → activation(+block_reset) → recompute(back-layers only)
+    Stage 전환 [Method B - CPU-based]:    sync → prefetch → activation → recompute(kv-only+back-layers)
     사용 모듈: progressive_serve/
+    Method 자동 감지: model.model._persistent_buffers_initialized 여부로 판단
     """
     print("\n" + "=" * 65)
     print(f"  BENCHMARK: Partial Mode  (model={model_name})")
@@ -644,10 +683,10 @@ def compare(path_a: str, path_b: str):
     def print_transition(label_12, ta, tb):
         print(f"\n  {'── ' + label_12 + ' ──':}")
 
-        # sync (partial only)
+        # sync (partial Method B only; Method A는 0.000s)
         va = ta.get("t_sync_s", 0.0)
         vb = tb.get("t_sync_s", 0.0)
-        print(fmt_row("  t_sync [GPU→CPU buffer, partial only]", va, vb))
+        print(fmt_row("  t_sync [Method B: GPU→CPU; Method A: 0]", va, vb))
 
         print(fmt_row("  t_prefetch [ckpt CPU load]",
                       ta.get("t_prefetch_s"), tb.get("t_prefetch_s")))
@@ -723,9 +762,13 @@ def compare(path_a: str, path_b: str):
                   f"[{winner}] faster by {saving:.2f}s ({pct:.0f}%)")
 
     print("\n  NOTE:")
-    print("  - t_first_chat in Origin = FULL PREFILL (all tokens recomputed)")
-    print("  - t_first_chat in Partial = only new user tokens processed")
-    print("  - t_recompute in Partial = boundary layers only (KV snapshot for front layers)")
+    print("  - t_first_chat in Origin  = FULL PREFILL (all tokens recomputed, KV cache cleared)")
+    print("  - t_first_chat in Partial = only new user tokens processed (KV cache preserved)")
+    print("  - t_sync in Partial       = 0.000s if Method A (GPU-resident); >0 if Method B (CPU sync)")
+    print("  - t_recompute in Partial:")
+    print("      Method A (GPU-resident): back layers only, GPU buffer → boundary hidden states,")
+    print("                               front KV cache in-place, no CPU↔GPU transfer")
+    print("      Method B (CPU-based):    KV-only pass (front layers) + full forward (back layers)")
     print("=" * W)
 
 

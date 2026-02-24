@@ -344,7 +344,30 @@ class ProgressiveForCausalLM(nn.Module):
                     loaded_keys.add(param_name)
                     loaded_count += 1
                     continue
-        
+
+            # Option 5: Falcon HuggingFace 형식 변환
+            # vLLM param:   model.layers.N.layer.*     (ProgressiveModelDualPath 래핑)
+            # HF checkpoint: transformer.h.N.*          (Falcon 원본 형식)
+            if self.model_type == "falcon":
+                import re
+                falcon_name = re.sub(
+                    r'^model\.layers\.(\d+)\.layer\.',
+                    lambda m: f'transformer.h.{m.group(1)}.',
+                    param_name,
+                )
+                if falcon_name == param_name:
+                    # 레이어가 아닌 파라미터: embed_tokens, norm
+                    falcon_name = param_name \
+                        .replace("model.embed_tokens.", "transformer.word_embeddings.") \
+                        .replace("model.norm.", "transformer.ln_f.")
+                if falcon_name != param_name and falcon_name in checkpoint_weights:
+                    weight_loader = getattr(param, "weight_loader",
+                                           lambda p, w: p.data.copy_(w))
+                    weight_loader(param, checkpoint_weights[falcon_name])
+                    loaded_keys.add(param_name)
+                    loaded_count += 1
+                    continue
+
         # Missing weights 처리
         missing_keys = set(params_dict.keys()) - loaded_keys
         
@@ -556,11 +579,14 @@ class ProgressiveForCausalLM(nn.Module):
             self.current_stage = 2
             self.inactive_layer_indices = set(self._get_c_indices())
 
-            # Partial KV recomputation 설정
+            # Partial KV recomputation 설정 (GPU-resident Mode A 우선)
             boundary = self.get_recompute_boundary(b_indices)
             if boundary is not None:
-                self.model.set_partial_recompute(boundary)
-                print(f"[Stage2] Partial recompute enabled: boundary={boundary}")
+                gpu_ok = self.model.set_recompute_from_boundary_gpu(boundary)
+                if not gpu_ok:
+                    # Fallback: CPU-based (버퍼 미초기화 시)
+                    self.model.set_partial_recompute(boundary)
+                    print(f"[Stage2] CPU-based partial recompute enabled: boundary={boundary}")
 
             # 캐싱 범위 설정 (Stage 3 boundary-1까지)
             max_cacheable = self._get_max_cacheable_layer()
@@ -593,11 +619,14 @@ class ProgressiveForCausalLM(nn.Module):
             self.current_stage = 3
             self.inactive_layer_indices = set()
 
-            # Partial KV recomputation 설정
+            # Partial KV recomputation 설정 (GPU-resident Mode A 우선)
             boundary = self.get_recompute_boundary(c_indices)
             if boundary is not None:
-                self.model.set_partial_recompute(boundary)
-                print(f"[Stage3] Partial recompute enabled: boundary={boundary}")
+                gpu_ok = self.model.set_recompute_from_boundary_gpu(boundary)
+                if not gpu_ok:
+                    # Fallback: CPU-based
+                    self.model.set_partial_recompute(boundary)
+                    print(f"[Stage3] CPU-based partial recompute enabled: boundary={boundary}")
 
             # 캐싱 범위 설정 (Stage 3는 모든 레이어)
             self.model._max_cacheable_layer = None

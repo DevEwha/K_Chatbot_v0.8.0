@@ -218,8 +218,8 @@ class ProgressiveChatbotPartial:
             print(f"  Stage B checkpoint not found: {stage_b_path}")
             return False
 
-        # 🔥 Stage 전환 전: GPU persistent buffer → CPU cache 동기화
-        self._sync_cache_before_transition()
+        # GPU-resident Mode A: CPU 복사 불필요 (GPU buffers에 이미 hidden states 존재)
+        # self._sync_cache_before_transition()  # 제거됨 (Method A)
 
         print("  [Stage 1 -> 2] Prefetching...")
         t0 = time.time()
@@ -245,7 +245,8 @@ class ProgressiveChatbotPartial:
               f"Progress: {stage_info['activation_progress']}")
 
         # 🔥 CRITICAL: Trigger partial recompute NOW with current conversation
-        # This ensures cached hidden states match the current prompt length
+        # Method A: block computed 상태 리셋 → fresh prefill 강제 → back layers 재계산
+        self._reset_block_computed_states()
         self._trigger_partial_recompute()
 
         return True
@@ -270,8 +271,8 @@ class ProgressiveChatbotPartial:
             print(f"  Stage C checkpoint not found: {stage_c_path}")
             return False
 
-        # 🔥 Stage 전환 전: GPU persistent buffer → CPU cache 동기화
-        self._sync_cache_before_transition()
+        # GPU-resident Mode A: CPU 복사 불필요
+        # self._sync_cache_before_transition()  # 제거됨 (Method A)
 
         print("  [Stage 2 -> 3] Prefetching...")
         t0 = time.time()
@@ -297,12 +298,40 @@ class ProgressiveChatbotPartial:
               f"Progress: {stage_info['activation_progress']}")
 
         # 🔥 CRITICAL: Trigger partial recompute NOW with current conversation
+        # Method A: block computed 상태 리셋 → fresh prefill 강제 → back layers 재계산
+        self._reset_block_computed_states()
         self._trigger_partial_recompute()
 
         return True
 
     # ----------------------------------------------------------------
-    # Persistent Buffer → CPU Cache 동기화
+    # Block Computed 상태 리셋 (Method A)
+    # ----------------------------------------------------------------
+    def _reset_block_computed_states(self):
+        """
+        Stage 전환 후 GPU-resident partial recompute 전 호출.
+
+        모든 KV cache block의 computed 플래그를 False로 리셋.
+        → next generate() 시 prefix caching이 context_len=0으로 판단
+        → model이 전체 대화 토큰을 prefill로 처리
+        → back layers만 재계산, front layers KV cache는 그대로 유지
+        """
+        engine = self.llm.llm_engine
+        if not hasattr(engine, 'scheduler') or not engine.scheduler:
+            print("  [Reset] Warning: cannot access scheduler")
+            return
+
+        scheduler = engine.scheduler[0]
+        block_manager = scheduler.block_manager
+        if hasattr(block_manager, 'mark_all_blocks_as_uncomputed'):
+            block_manager.mark_all_blocks_as_uncomputed()
+            print("  [Reset] All KV blocks marked as uncomputed → forcing fresh prefill")
+        else:
+            print("  [Reset] Warning: block_manager does not support "
+                  "mark_all_blocks_as_uncomputed")
+
+    # ----------------------------------------------------------------
+    # Persistent Buffer → CPU Cache 동기화 (구버전 CPU-based, 참조용 유지)
     # ----------------------------------------------------------------
     def _sync_cache_before_transition(self):
         """

@@ -67,8 +67,9 @@ class ProgressiveModelDualPath(nn.Module):
 
     Partial KV Recomputation:
     - Stage 전환 시 boundary layer 기준 KV cache 부분 재계산
-    - Boundary 이전 layer: KV-only (norm + qkv_proj + rotary + cache write)
-    - Boundary 이후 layer: full forward
+    - Boundary 이전 layer: 완전 스킵 (hidden states CPU 캐시 복원,
+        KV는 vLLM prefix caching이 Stage 1 블록 재사용 → 이미 유효)
+    - Boundary 이후 layer: full forward (새 가중치로 KV 재계산)
     - Prefill(eager mode)에서만 동작 → CUDA Graph 재캡처 없음
     """
 
@@ -116,6 +117,17 @@ class ProgressiveModelDualPath(nn.Module):
         # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
         self._max_cacheable_layer: Optional[int] = None
 
+        # ── KV Snapshot (Stage 전환 전 GPU 캐시에서 읽어온 K,V) ──
+        # Stage N의 KV cache는 layers 0~boundary-1에 대해 Stage N+1과 동일.
+        # 따라서 Stage 전환 전에 GPU block에서 K,V를 직접 읽어 CPU에 저장하면
+        # partial recompute 시 projection/attention 연산 없이 memcopy만으로 복원 가능.
+        #
+        # layer_idx → (K_cpu [full_tokens, num_kv_heads, head_size],
+        #               V_cpu [full_tokens, num_kv_heads, head_size])
+        # Full blocks만 저장 (마지막 partial block은 QKV_write_only로 계산)
+        self._kv_snapshot: Optional[Dict[int, tuple]] = None
+        self._snapshot_num_full_tokens: int = 0
+
         # ── Persistent GPU Buffers (CUDA graph safe) ──
         # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
         # Prefill (eager): 직접 실행, Decode (graph replay): 자동 실행
@@ -123,6 +135,9 @@ class ProgressiveModelDualPath(nn.Module):
         self._persistent_h_buffers: List[torch.Tensor] = []
         self._persistent_r_buffers: List[torch.Tensor] = []
         self._persistent_buffers_initialized = False
+        # 실제 inference 데이터가 기록된 레이어 집합
+        # clear_persistent_buffers() 후 zeros인 레이어를 캐시에 올리지 않기 위해 추적
+        self._populated_layers: set = set()
 
         print(f"✅ Initialized ProgressiveModelDualPath for: {self.model_type}")
         print(f"✅ Layer forward mode: {self._layer_forward_mode}")
@@ -329,12 +344,20 @@ class ProgressiveModelDualPath(nn.Module):
         max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
 
         self._layer_output_cache.clear()
+        synced = 0
+        skipped = 0
         for layer_idx in range(max_layer + 1):
+            if layer_idx not in self._populated_layers:
+                # 실제 inference 데이터가 없음 (zeros) → 캐시에 올리지 않음
+                skipped += 1
+                continue
             h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
             r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
             self._layer_output_cache[layer_idx] = {"output": (h, r)}
+            synced += 1
 
-        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
+        print(f"[Cache] Synced {synced} layers × {seq_len} tokens (GPU → CPU)"
+              + (f", skipped {skipped} unpopulated" if skipped else ""))
 
     def clear_persistent_buffers(self):
         """Persistent buffer 초기화 (warmup 데이터 제거)"""
@@ -343,6 +366,7 @@ class ProgressiveModelDualPath(nn.Module):
                 buf.zero_()
             for buf in self._persistent_r_buffers:
                 buf.zero_()
+        self._populated_layers.clear()
 
     # ================================================================
     # Forward: Dual-Path Design (Universal for all decoder models)
@@ -364,9 +388,10 @@ class ProgressiveModelDualPath(nn.Module):
         3. Alpha로 선택
 
         Partial KV Recomputation:
-        - _partial_recompute_boundary가 설정되면, boundary 이전 레이어는
-          KV-only forward (norm+qkv+rotary+cache_write만), boundary 이후는 full forward
-        - 캐시된 hidden states를 사용해 boundary 이전 레이어를 빠르게 처리
+        - _partial_recompute_boundary가 설정되면:
+          * Boundary 이전 레이어: 완전 스킵 (hidden states CPU 캐시에서 복원,
+            KV는 vLLM prefix caching이 Stage 1 블록 재사용 → 이미 유효)
+          * Boundary 이후 레이어: full forward (새 가중치로 KV 재계산)
         - Prefill(eager mode)에서만 동작 → CUDA Graph 재캡처 없음
 
         CUDA Graph Safety:
@@ -391,52 +416,158 @@ class ProgressiveModelDualPath(nn.Module):
             and self._is_cache_compatible(hidden_states)
         )
 
-        # 디버그: Partial recompute 시작
+        # ── Partial KV Recompute: 공통 변수 준비 ──
         if use_partial:
-            print(f"\n[PartialRecompute] 🚀 Starting partial KV recomputation")
-            print(f"  Boundary: {boundary}")
-            print(f"  Cached layers: {len(self._layer_output_cache)}")
-            kv_only_count = 0
+            # Forward context에서 slot_mapping 가져오기 (K,V write에 필요)
+            from vllm.forward_context import get_forward_context as _get_fwd_ctx
+            _fwd_ctx = _get_fwd_ctx()
+            _slot_mapping = _fwd_ctx.attn_metadata.slot_mapping  # [num_tokens]
+
+            # KV Snapshot 상태 확인
+            _has_snap = (self._kv_snapshot is not None
+                         and len(self._kv_snapshot) > 0)
+            _n_full = self._snapshot_num_full_tokens  # full-block 토큰 수
+
+            snap_count = 0    # KV snapshot memcopy로 처리한 레이어 수
+            proj_count = 0    # QKV_write_only로 처리한 레이어 수
             full_forward_count = 0
+
+            _snap_mode = (f"snapshot ({_n_full} full-block tokens) + QKV_write_only fallback"
+                          if _has_snap else "QKV_write_only (no snapshot)")
+            print(f"\n[PartialRecompute] 🚀 Front layers 0~{boundary-1}: {_snap_mode}")
+            print(f"                      Back  layers {boundary}~{len(self.layers)-1}: full forward")
 
         for layer_idx, layer_wrapper in enumerate(self.layers):
 
             if use_partial and layer_idx < boundary:
-                # ── KV-only path: 캐시된 hidden states로 KV만 기록 ──
-
-                # 입력 결정: Layer 0은 현재 embedding, 나머지는 이전 레이어 출력
-                if layer_idx == 0:
-                    kv_input_h = hidden_states
-                    kv_input_r = residual
-                else:
-                    prev_cached = self._layer_output_cache.get(layer_idx - 1)
-                    if prev_cached is not None:
-                        kv_input_h = prev_cached["output"][0].to(hidden_states.device)
-                        kv_input_r = prev_cached["output"][1].to(hidden_states.device) if prev_cached["output"][1] is not None else None
-                    else:
-                        # Fallback: 현재 hidden states 사용
-                        kv_input_h = hidden_states
-                        kv_input_r = residual
-
-                # KV-only: norm → qkv_proj → rotary → cache_write
-                self._kv_only_forward_layer(
-                    layer_wrapper.layer,
-                    positions=positions,
-                    hidden_states=kv_input_h,
-                    residual=kv_input_r,
-                )
-
-                # 출력: 현재 레이어 캐시에서
+                # ══════════════════════════════════════════════════════════════
+                # Front Layer KV Write (weights 불변 → K,V Stage N+1 == Stage N)
+                #
+                # 전략:
+                # 1. Full blocks (0..n_full-1 토큰):
+                #    KV Snapshot에서 GPU memcopy → FLOPs 0
+                #    (Stage 전환 전 GPU 캐시에서 직접 읽은 값)
+                # 2. Partial last block (n_full..total-1 토큰):
+                #    QKV proj + rope → K,V 쓰기 (flash_attn / o_proj 생략)
+                # 3. hidden_states는 항상 CPU 캐시에서 복원
+                # ══════════════════════════════════════════════════════════════
                 cached = self._layer_output_cache.get(layer_idx)
                 if cached is not None:
-                    hidden_states = cached["output"][0].to(hidden_states.device)
-                    residual = cached["output"][1].to(hidden_states.device) if cached["output"][1] is not None else None
+                    base_layer = layer_wrapper.layer
+                    _dev = hidden_states.device
+                    _n_total = hidden_states.shape[0]
 
-                    # 디버그: KV-only 카운트
-                    if layer_idx == 0 or layer_idx % 5 == 0 or layer_idx == boundary - 1:
-                        print(f"  Layer {layer_idx:2d}: ✓ KV-only (cached)")
-                    kv_only_count += 1
+                    if (_has_snap
+                            and layer_idx in self._kv_snapshot
+                            and hasattr(base_layer, 'self_attn')):
+
+                        # ── 방법 A (최적): KV Snapshot memcopy ──────────────
+                        _saved_k, _saved_v = self._kv_snapshot[layer_idx]
+                        _attn_obj = base_layer.self_attn.attn  # Attention 객체
+
+                        # Part 1: Full blocks → pure GPU memcopy (FLOPs = 0)
+                        if _n_full > 0:
+                            _sm_full = _slot_mapping[:_n_full]
+                            _attn_obj.write_kv_to_cache(
+                                _saved_k.to(_dev),
+                                _saved_v.to(_dev),
+                                slot_mapping=_sm_full,
+                            )
+
+                        # Part 2: Partial last block → QKV proj only (flash_attn 생략)
+                        if _n_full < _n_total:
+                            _n_partial = _n_total - _n_full
+                            _sm_partial = _slot_mapping[_n_full:]
+                            _partial_pos = positions[_n_full:]
+
+                            # hidden_states for partial block
+                            # (현재 hidden_states는 embedding or 이전 레이어 복원값)
+                            _ph = hidden_states[_n_full:]
+                            _pr = residual[_n_full:] if residual is not None else None
+
+                            # input_layernorm for partial block
+                            _attn_m = base_layer.self_attn
+                            try:
+                                if _pr is not None:
+                                    _normed_p, _ = base_layer.input_layernorm(_ph, _pr)
+                                else:
+                                    _r = base_layer.input_layernorm(_ph)
+                                    _normed_p = _r[0] if isinstance(_r, tuple) else _r
+                            except Exception:
+                                _normed_p = base_layer.input_layernorm(_ph)
+                                if isinstance(_normed_p, tuple):
+                                    _normed_p = _normed_p[0]
+
+                            # QKV projection (fused: q, k, v 동시 계산)
+                            _qkv, _ = _attn_m.qkv_proj(_normed_p)
+                            _q_p, _k_p, _v_p = _qkv.split(
+                                [_attn_m.q_size, _attn_m.kv_size, _attn_m.kv_size],
+                                dim=-1,
+                            )
+
+                            # Apply rotary embedding (q_rot 버림, k_rot만 사용)
+                            _, _k_rot_p = _attn_m.rotary_emb(_partial_pos, _q_p, _k_p)
+
+                            # K,V 쓰기 (flash_attn 없음)
+                            _attn_obj.write_kv_to_cache(
+                                _k_rot_p, _v_p,
+                                slot_mapping=_sm_partial,
+                            )
+
+                            print(f"  [KV_REUSE  ✅] Layer {layer_idx:2d}: "
+                                  f"{_n_full} tokens ← snapshot (memcopy, 0 FLOPs) | "
+                                  f"{_n_partial} tokens ← QKV_write_only")
+                        else:
+                            print(f"  [KV_REUSE  ✅] Layer {layer_idx:2d}: "
+                                  f"{_n_full} tokens ← snapshot (memcopy, 0 FLOPs)")
+
+                        snap_count += 1
+
+                    elif hasattr(base_layer, 'self_attn') and hasattr(base_layer, 'input_layernorm'):
+                        # ── 방법 B (Fallback): QKV_write_only (snapshot 없음) ──
+                        # qkv_proj + rope → K,V 쓰기 (flash_attn / o_proj 생략)
+                        _attn_obj = base_layer.self_attn.attn
+                        _attn_m = base_layer.self_attn
+
+                        try:
+                            if residual is None:
+                                _normed_h = base_layer.input_layernorm(hidden_states)
+                                if isinstance(_normed_h, tuple):
+                                    _normed_h = _normed_h[0]
+                            else:
+                                _normed_h, _ = base_layer.input_layernorm(hidden_states, residual)
+                        except Exception:
+                            _normed_h = base_layer.input_layernorm(hidden_states)
+                            if isinstance(_normed_h, tuple):
+                                _normed_h = _normed_h[0]
+
+                        _qkv, _ = _attn_m.qkv_proj(_normed_h)
+                        _q, _k, _v = _qkv.split(
+                            [_attn_m.q_size, _attn_m.kv_size, _attn_m.kv_size],
+                            dim=-1,
+                        )
+                        _, _k_rot = _attn_m.rotary_emb(positions, _q, _k)
+                        _attn_obj.write_kv_to_cache(_k_rot, _v)  # full slot_mapping
+
+                        print(f"  [KV_PROJ   ⚡] Layer {layer_idx:2d}: "
+                              f"{_n_total} tokens ← QKV_write_only "
+                              f"(qkv_proj+rope, no flash_attn)")
+                        proj_count += 1
+
+                    else:
+                        print(f"  [KV_SKIP   ⚠️] Layer {layer_idx:2d}: "
+                              f"no self_attn attr → KV not written")
+
+                    # ── hidden_states 복원 (Stage N 값 그대로, CPU → GPU) ──
+                    hidden_states = cached["output"][0].to(_dev)
+                    residual = (
+                        cached["output"][1].to(_dev)
+                        if cached["output"][1] is not None else None
+                    )
                     continue
+
+                # Cache miss: fall through to normal forward
+                print(f"  [CACHE_MISS ⚠️] Layer {layer_idx:2d}: hidden cache miss → normal forward")
 
             # ── Normal dual-path forward ──
             # Alpha 값 (tensor, CUDA Graph safe!)
@@ -474,20 +605,30 @@ class ProgressiveModelDualPath(nn.Module):
                 self._persistent_h_buffers[layer_idx].index_copy_(0, positions, hidden_states)
                 if residual is not None:
                     self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
+                self._populated_layers.add(layer_idx)
 
-            # 디버그: Full forward 카운트
+            # 로그: Full forward 카운트
             if use_partial and layer_idx >= boundary:
                 if layer_idx == boundary or layer_idx % 5 == 0 or layer_idx == len(self.layers) - 1:
-                    print(f"  Layer {layer_idx:2d}: ↻ Full forward (recompute)")
+                    print(f"  [KV_RECOMPUTE 🔄] Layer {layer_idx:2d}: full forward (new weights, K,V recomputed)")
                 full_forward_count += 1
 
-        # 디버그: Partial recompute 완료 통계
+        # Partial recompute 완료 통계
         if use_partial:
+            front_layers = boundary
+            total_layers = len(self.layers)
+            savings_pct = (front_layers / total_layers) * 100
             print(f"\n[PartialRecompute] ✅ Completed")
-            print(f"  KV-only:      {kv_only_count} layers (skipped attention+MLP)")
-            print(f"  Full forward: {full_forward_count} layers (recomputed)")
-            savings = (kv_only_count / len(self.layers)) * 100
-            print(f"  Savings:      ~{savings:.1f}% of layers optimized\n")
+            print(f"  Front layers (0~{boundary-1}):  {snap_count} via KV snapshot memcopy, "
+                  f"{proj_count} via QKV_write_only  → K,V REUSED (no attention compute)")
+            print(f"  Back  layers ({boundary}~{total_layers-1}): {full_forward_count} full forward "
+                  f"→ K,V RECOMPUTED (new weights)")
+            print(f"  Compute savings: ~{savings_pct:.1f}% "
+                  f"({front_layers} layers × attention/MLP skipped)\n")
+
+            # KV snapshot은 1회 사용 후 클리어
+            self._kv_snapshot = None
+            self._snapshot_num_full_tokens = 0
 
         # Partial recompute는 1회성 (성공 여부 무관, 다음 forward부터 일반 모드)
         if boundary is not None:
@@ -530,62 +671,50 @@ class ProgressiveModelDualPath(nn.Module):
               f"{'✅ Compatible' if compatible else '❌ Incompatible'}")
         return compatible
 
-    def _kv_only_forward_layer(
+    def set_kv_snapshot(
         self,
-        layer: nn.Module,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        snapshot: Optional[Dict[int, tuple]],
+        num_full_tokens: int,
     ) -> None:
         """
-        KV-only forward: norm → qkv_proj → rotary → write_kv_to_cache
-        Attention 연산(softmax + o_proj) 및 MLP 실행 안 함.
+        Stage 전환 전 GPU 캐시에서 읽어온 K,V 스냅샷 설정.
 
-        지원: Llama, Mistral, Qwen2, Gemma 등 self_attn 패턴 모델
+        snapshot: layer_idx → (K_cpu [N, num_kv_heads, head_size],
+                                V_cpu [N, num_kv_heads, head_size])
+                  None이면 스냅샷 없음 → 구 attention-only 방식으로 fallback
+
+        num_full_tokens: 스냅샷에 저장된 full-block 토큰 수
+                        (전체 토큰의 마지막 partial block은 제외됨)
+
+        동작 (partial recompute 시 layers 0~boundary-1에서):
+        1. Full blocks (0..num_full_tokens-1 토큰):
+           GPU memcopy만으로 K,V 복원 → FLOPs 0
+        2. Partial last block (num_full_tokens..total-1 토큰):
+           QKV proj + rope → K,V 쓰기 (flash_attn 생략)
         """
-        # 1. Input layernorm
-        if hasattr(layer, 'input_layernorm'):
-            if residual is None:
-                normed = layer.input_layernorm(hidden_states)
-            else:
-                normed, _ = layer.input_layernorm(hidden_states, residual)
+        self._kv_snapshot = snapshot
+        self._snapshot_num_full_tokens = num_full_tokens
+        if snapshot:
+            n_layers = len(snapshot)
+            print(f"[KVSnapshot] ✅ Snapshot loaded: {n_layers} layers, "
+                  f"{num_full_tokens} full-block tokens stored (GPU→CPU memcopy)")
         else:
-            normed = hidden_states
-
-        # 2. QKV projection + rotary + cache write
-        attn = getattr(layer, 'self_attn', None)
-        if attn is None:
-            return
-
-        # qkv_proj
-        qkv_proj = getattr(attn, 'qkv_proj', None)
-        if qkv_proj is None:
-            return
-
-        qkv, _ = qkv_proj(normed)
-
-        # Split Q, K, V
-        q_size = getattr(attn, 'q_size', None)
-        kv_size = getattr(attn, 'kv_size', None)
-        if q_size is None or kv_size is None:
-            return
-
-        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-        # Rotary embedding
-        rotary_emb = getattr(attn, 'rotary_emb', None)
-        if rotary_emb is not None:
-            q, k = rotary_emb(positions, q, k)
-
-        # Write to KV cache (skip attention computation)
-        attn_module = getattr(attn, 'attn', None)
-        if attn_module is not None and hasattr(attn_module, 'write_kv_to_cache'):
-            attn_module.write_kv_to_cache(k, v)
+            print(f"[KVSnapshot] ⚠️  No snapshot → will use QKV_write_only fallback")
 
     def set_partial_recompute(self, boundary_layer_idx: int) -> None:
         """
-        Stage 전환 후 partial KV recomputation 모드 설정.
-        boundary_layer_idx 이전 layer는 KV-only, 이후는 full forward.
+        Stage 전환 후 partial recompute 모드 설정.
+
+        boundary_layer_idx 이전 layer (weights 불변):
+            - KV Snapshot이 있으면: GPU memcopy로 K,V 복원 (FLOPs 0)
+            - 없으면: QKV proj + rope → K,V 쓰기 (flash_attn 생략)
+            - hidden_states, residual은 CPU 캐시에서 복원
+        boundary_layer_idx 이후 layer (weights 변경됨):
+            - full forward (새 가중치로 K,V 재계산)
+
+        사전 조건:
+            - set_kv_snapshot()으로 KV 스냅샷 설정 (chatbot에서 호출)
+            - llm.reset_prefix_cache()로 stale blocks 퇴출해야 함
         """
         if boundary_layer_idx <= 0 or boundary_layer_idx >= len(self.layers):
             print(f"[PartialRecompute] Invalid boundary {boundary_layer_idx}, "
@@ -600,9 +729,12 @@ class ProgressiveModelDualPath(nn.Module):
             return
 
         self._partial_recompute_boundary = boundary_layer_idx
+        has_snap = (self._kv_snapshot is not None and len(self._kv_snapshot) > 0)
+        front_mode = (f"KV snapshot memcopy ({self._snapshot_num_full_tokens} tokens) "
+                      f"+ QKV_write_only fallback" if has_snap else "QKV_write_only")
         print(f"[PartialRecompute] Boundary set at layer {boundary_layer_idx}")
-        print(f"  Layers 0-{boundary_layer_idx-1}: KV-only (cached hidden states)")
-        print(f"  Layers {boundary_layer_idx}-{len(self.layers)-1}: full forward")
+        print(f"  Layers 0-{boundary_layer_idx-1}: {front_mode} (hidden states from CPU cache)")
+        print(f"  Layers {boundary_layer_idx}-{len(self.layers)-1}: full forward (new weights)")
 
     def clear_hidden_cache(self) -> None:
         """Hidden state 캐시 초기화"""

@@ -290,6 +290,24 @@ class ProgressiveForCausalLM(nn.Module):
         checkpoint_weights = {}
         for name, tensor in weights:
             checkpoint_weights[name] = tensor
+
+        # Falcon checkpoints often use "transformer.h.*" keys while this
+        # progressive wrapper expects "model.layers.*" namespace.
+        if self.model_type == "falcon":
+            aliases: Dict[str, torch.Tensor] = {}
+            for name, tensor in checkpoint_weights.items():
+                if name.startswith("transformer.h."):
+                    aliases["model.layers." + name[len("transformer.h."):]] = tensor
+                elif name == "transformer.word_embeddings.weight":
+                    aliases["model.embed_tokens.weight"] = tensor
+                elif name == "transformer.ln_f.weight":
+                    aliases["model.norm.weight"] = tensor
+                elif name == "lm_head.weight":
+                    # Tie-mode Falcon can consume lm_head as embed weights.
+                    aliases.setdefault("model.embed_tokens.weight", tensor)
+            if aliases:
+                checkpoint_weights.update(aliases)
+                print(f"Applied Falcon key aliases: +{len(aliases)}")
         
         print(f"Total weights in checkpoint: {len(checkpoint_weights)}")
         

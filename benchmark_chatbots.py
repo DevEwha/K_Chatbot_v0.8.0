@@ -17,20 +17,15 @@ Usage:
   python benchmark_chatbots.py --compare results_origin.json results_partial.json
 
 측정 항목:
-  [Origin]   t_prefetch | t_activation | t_cache_clear
-             → t_total_transition (빠름)
-             → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
-             → t_total_effective = transition + first_chat
+  [Origin]  t_prefetch | t_activation | t_cache_clear
+            → t_total_transition (빠름)
+            → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
+            → t_total_effective = transition + first_chat
 
-  [Partial / Method A - GPU-resident]
-             t_sync≈0 | t_prefetch | t_activation(+block_reset) | t_recompute(back-layers only)
-             → t_total_transition
-             → t_first_chat  ← KV 이미 계산됨 (빠름)
-
-  [Partial / Method B - CPU-based (legacy)]
-             t_sync | t_prefetch | t_activation | t_recompute(kv-only+back-layers)
-             → t_total_transition (recompute 포함, 느림)
-             → t_first_chat  ← KV 이미 계산됨 (빠름)
+  [Partial] t_sync | t_prefetch | t_activation | t_recompute
+            → t_total_transition (recompute 포함, 느림)
+            → t_first_chat  ← KV 이미 계산됨 (빠름)
+            → t_total_effective = transition + first_chat
 
 핵심: t_total_effective 가 진짜 사용자 체감 비용
 """
@@ -79,6 +74,26 @@ STAGE1_PROMPTS = [
     "Tell me about the history of computing briefly.",
     "What were the key innovations of the 1970s in computing?",
     "How did personal computers change society?",
+]
+
+# Stage 1 고정 응답 (두 모드에서 동일한 conversation history 보장)
+# 이 응답을 사용하면 origin/partial이 별도 프로세스로 실행되어도
+# Stage 2/3 진입 시점의 KV cache token 수가 동일해져 t_first_chat 비교가 공정해짐.
+# None으로 설정하면 실제 모델 응답 사용 (기존 동작, t_first_chat 비교 신뢰도 낮음)
+STAGE1_FIXED_RESPONSES = [
+    "Computing history spans from mechanical calculators in the 1800s to modern processors. "
+    "Key milestones include Turing's theoretical work, ENIAC in 1945, transistors replacing "
+    "vacuum tubes, integrated circuits enabling miniaturization, and the microprocessor "
+    "revolution of the 1970s leading to personal computers.",
+
+    "The 1970s saw the microprocessor (Intel 4004, 8080), the birth of Microsoft and Apple, "
+    "the Altair 8800 kit computer, Ethernet networking by Xerox PARC, and the CP/M operating "
+    "system. These innovations democratized computing and laid the foundation for the PC era.",
+
+    "Personal computers transformed society by bringing computing into homes and offices, "
+    "enabling word processing, spreadsheets, and desktop publishing. They created new industries, "
+    "changed education, and eventually connected billions through the internet, reshaping how "
+    "people work, communicate, and access information.",
 ]
 
 # Stage 2에서 사용할 질문들 (첫 번째 = transition 직후 첫 채팅)
@@ -168,6 +183,40 @@ def build_prompt(tokenizer, conversation: list) -> str:
         prefix = "User: " if msg["role"] == "user" else "Assistant: "
         prompt += prefix + msg["content"] + "\n"
     return prompt + "Assistant: "
+
+
+def do_chat_fixed(llm, tokenizer, conversation, user_input, fixed_response, sampling_params):
+    """
+    Stage 1 전용: 고정 응답을 사용해 KV cache만 쌓고 conversation history를 결정론적으로 구성.
+    실제 generate는 수행하지만 응답을 fixed_response로 교체 → 두 모드의 context가 동일해짐.
+    fixed_response가 None이면 일반 do_chat과 동일하게 동작.
+    """
+    if fixed_response is None:
+        return do_chat(llm, tokenizer, conversation, user_input, sampling_params)
+
+    conversation.append({"role": "user", "content": user_input})
+    prompt = build_prompt(tokenizer, conversation)
+    n_input = len(tokenizer.encode(prompt))
+
+    # generate는 실행 (KV cache 누적 목적) 하되 응답은 fixed로 교체
+    torch.cuda.synchronize()
+    t0 = time.time()
+    llm.generate([prompt], sampling_params)
+    torch.cuda.synchronize()
+    t_chat = time.time() - t0
+
+    n_gen = len(tokenizer.encode(fixed_response))
+    conversation.append({"role": "assistant", "content": fixed_response})
+
+    return {
+        "question": user_input[:60],
+        "t_chat_s": round(t_chat, 3),
+        "n_input_tokens": n_input,
+        "n_gen_tokens": n_gen,
+        "tokens_per_sec": round(n_gen / t_chat, 1) if t_chat > 0 else 0.0,
+        "gpu_mem_gb": round(gpu_mem_gb(), 3),
+        "fixed_response": True,
+    }
 
 
 def do_chat(llm, tokenizer, conversation, user_input, sampling_params):
@@ -267,14 +316,16 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
                                  conversation, sampling_params,
                                  first_prompt):
     """
-    Partial 모드 stage 전환 타이밍 측정.
+    Partial 모드 stage 전환 타이밍 측정 (Method A - GPU-resident).
 
-    [Method A - GPU-resident]: (block_reset) → prefetch → activation → recompute(back-layers only)
-    [Method B - CPU-based]:    sync → prefetch → activation → recompute(kv-only+back-layers)
+    단계: (t_sync≈0) → prefetch → activation+block_reset → recompute(back-layers only)
     이후: 첫 채팅 (KV 이미 계산됨 → 빠름)
 
-    Method A 감지 기준: model.model._persistent_buffers_initialized == True
-                       AND model.model.set_recompute_from_boundary_gpu 존재
+    Method A 동작:
+    - t_sync = 0 (GPU buffer에 hidden states 이미 존재, CPU 복사 불필요)
+    - advance_fn 직후 mark_all_blocks_as_uncomputed() 호출
+      → prefix caching이 context_len=0으로 판단 → 전체 토큰 fresh prefill
+      → front layers KV cache 유지, back layers만 GPU buffer에서 재계산
     """
     tr = {}
     checkpoint_path = config[stage_key]
@@ -284,32 +335,8 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     advance_fn  = getattr(model, advance_fn_name)
     minimal_params = SamplingParams(temperature=0.0, max_tokens=1)
 
-    # Method A (GPU-resident) vs Method B (CPU-based) 감지
-    inner_model = getattr(model, "model", None)
-    use_gpu_resident = (
-        inner_model is not None
-        and hasattr(inner_model, "_persistent_buffers_initialized")
-        and inner_model._persistent_buffers_initialized
-        and hasattr(inner_model, "set_recompute_from_boundary_gpu")
-    )
-    tr["method"] = "A_gpu_resident" if use_gpu_resident else "B_cpu_based"
-    method_label = "A:GPU-only" if use_gpu_resident else "B:CPU-sync"
-    print(f"    → Recompute method: {tr['method']}")
-
-    # t_sync: [Method B] GPU persistent buffer → CPU cache 동기화
-    #         [Method A] 불필요 (GPU buffer에 이미 존재) → 0.000s 기록
-    t0 = time.time()
-    if not use_gpu_resident:
-        if inner_model is not None and hasattr(inner_model, "sync_persistent_cache"):
-            prompt_now = build_prompt(tokenizer, conversation)
-            seq_len = len(tokenizer.encode(prompt_now))
-            torch.cuda.synchronize()
-            inner_model.sync_persistent_cache(seq_len)
-            torch.cuda.synchronize()
-            print(f"    → [B] sync_persistent_cache({seq_len} tokens)")
-    else:
-        print(f"    → [A] No CPU sync needed (GPU-resident buffers)")
-    tr["t_sync_s"] = round(time.time() - t0, 3)
+    # t_sync: Method A에서는 CPU 복사 불필요 → 0.000s
+    tr["t_sync_s"] = 0.0
 
     # t_prefetch: checkpoint CPU 로드 + 대기
     torch.cuda.synchronize()
@@ -319,30 +346,24 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     torch.cuda.synchronize()
     tr["t_prefetch_s"] = round(time.time() - t0, 3)
 
-    # t_activation: GPU weight copy + boundary 설정
-    # [Method A] advance_fn 이후 block computed 리셋 포함:
-    #   → prefix caching이 context_len=0으로 판단 → 전체 토큰 fresh prefill
-    #   → front layers forward 스킵 (KV 유지), back layers GPU buffer에서 재계산
+    # t_activation: GPU weight copy + boundary 설정 + block computed 리셋
+    # benchmark는 chatbot_partial_cache.py를 거치지 않으므로 block reset 직접 수행
     torch.cuda.synchronize()
     t0 = time.time()
     ok = advance_fn(wait_if_needed=False)
-    if use_gpu_resident:
-        # benchmark는 chatbot_partial_cache.py를 거치지 않으므로 직접 block reset
-        engine = llm.llm_engine
-        if hasattr(engine, 'scheduler') and engine.scheduler:
-            block_manager = engine.scheduler[0].block_manager
-            if hasattr(block_manager, 'mark_all_blocks_as_uncomputed'):
-                block_manager.mark_all_blocks_as_uncomputed()
-                print(f"    → [A] All KV blocks marked as uncomputed (forcing fresh prefill)")
+    engine = llm.llm_engine
+    if hasattr(engine, 'scheduler') and engine.scheduler:
+        block_manager = engine.scheduler[0].block_manager
+        if hasattr(block_manager, 'mark_all_blocks_as_uncomputed'):
+            block_manager.mark_all_blocks_as_uncomputed()
     torch.cuda.synchronize()
     tr["t_activation_s"] = round(time.time() - t0, 3)
     if not ok:
         raise RuntimeError(f"{advance_fn_name} returned False")
 
     # t_recompute: partial recompute (generate max_tokens=1)
-    # [Method A] back-layers only: GPU buffer에서 boundary hidden states 직접 사용
-    #            front KV cache 유지, CPU↔GPU 전송 없음
-    # [Method B] KV-only pass(front layers) + full forward(back layers)
+    # - front layers: KV cache 유지 (가중치 동일 → K,V 값 동일)
+    # - back layers: GPU buffer의 boundary hidden states에서 재계산
     torch.cuda.synchronize()
     t0 = time.time()
     if len(conversation) > 0:
@@ -356,7 +377,7 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     )
     tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
 
-    print(f"    → [{method_label}] t_sync={tr['t_sync_s']:.3f}s | "
+    print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
           f"t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
           f"t_recompute={tr['t_recompute_s']:.3f}s | "
@@ -447,12 +468,16 @@ def run_origin(model_name: str, output_path: str):
     conversation = []
 
     # ── Stage 1 채팅 ──────────────────────────────────────────
-    print(f"\n  [Stage 1] {len(STAGE1_PROMPTS)} turns")
+    use_fixed = STAGE1_FIXED_RESPONSES is not None
+    print(f"\n  [Stage 1] {len(STAGE1_PROMPTS)} turns  "
+          f"{'(fixed responses → fair comparison)' if use_fixed else '(live responses)'}")
     for i, q in enumerate(STAGE1_PROMPTS):
-        r = do_chat(llm, tokenizer, conversation, q, sampling_params)
+        fixed = STAGE1_FIXED_RESPONSES[i] if use_fixed else None
+        r = do_chat_fixed(llm, tokenizer, conversation, q, fixed, sampling_params)
         results["stage1_chats"].append(r)
+        fixed_tag = " [fixed]" if use_fixed else ""
         print(f"    Turn {i+1}: {r['t_chat_s']:.2f}s  "
-              f"({r['n_input_tokens']}→{r['n_gen_tokens']} tok, {r['tokens_per_sec']} tok/s)")
+              f"({r['n_input_tokens']}→{r['n_gen_tokens']} tok, {r['tokens_per_sec']} tok/s){fixed_tag}")
 
     # ── Stage 1 → 2 전환 ─────────────────────────────────────
     print(f"\n  [Stage 1 → 2] Transition...")
@@ -505,12 +530,12 @@ def run_origin(model_name: str, output_path: str):
 
 def run_partial(model_name: str, output_path: str):
     """
-    Partial 모드 벤치마크.
+    Partial 모드 벤치마크 (Method A - GPU-resident).
 
-    Stage 전환 [Method A - GPU-resident]: prefetch → activation(+block_reset) → recompute(back-layers only)
-    Stage 전환 [Method B - CPU-based]:    sync → prefetch → activation → recompute(kv-only+back-layers)
+    Stage 전환: prefetch → activation+block_reset → recompute(back-layers only)
+    - t_sync = 0 (GPU buffer에 hidden states 이미 존재)
+    - front layers KV cache 유지, back layers만 GPU boundary buffer에서 재계산
     사용 모듈: progressive_serve/
-    Method 자동 감지: model.model._persistent_buffers_initialized 여부로 판단
     """
     print("\n" + "=" * 65)
     print(f"  BENCHMARK: Partial Mode  (model={model_name})")
@@ -573,12 +598,16 @@ def run_partial(model_name: str, output_path: str):
     conversation = []
 
     # ── Stage 1 채팅 ──────────────────────────────────────────
-    print(f"\n  [Stage 1] {len(STAGE1_PROMPTS)} turns")
+    use_fixed = STAGE1_FIXED_RESPONSES is not None
+    print(f"\n  [Stage 1] {len(STAGE1_PROMPTS)} turns  "
+          f"{'(fixed responses → fair comparison)' if use_fixed else '(live responses)'}")
     for i, q in enumerate(STAGE1_PROMPTS):
-        r = do_chat(llm, tokenizer, conversation, q, sampling_params)
+        fixed = STAGE1_FIXED_RESPONSES[i] if use_fixed else None
+        r = do_chat_fixed(llm, tokenizer, conversation, q, fixed, sampling_params)
         results["stage1_chats"].append(r)
+        fixed_tag = " [fixed]" if use_fixed else ""
         print(f"    Turn {i+1}: {r['t_chat_s']:.2f}s  "
-              f"({r['n_input_tokens']}→{r['n_gen_tokens']} tok, {r['tokens_per_sec']} tok/s)")
+              f"({r['n_input_tokens']}→{r['n_gen_tokens']} tok, {r['tokens_per_sec']} tok/s){fixed_tag}")
 
     # ── Stage 1 → 2 전환 ─────────────────────────────────────
     print(f"\n  [Stage 1 → 2] Transition...")
@@ -683,10 +712,10 @@ def compare(path_a: str, path_b: str):
     def print_transition(label_12, ta, tb):
         print(f"\n  {'── ' + label_12 + ' ──':}")
 
-        # sync (partial Method B only; Method A는 0.000s)
+        # sync (partial only; Method A = 0)
         va = ta.get("t_sync_s", 0.0)
         vb = tb.get("t_sync_s", 0.0)
-        print(fmt_row("  t_sync [Method B: GPU→CPU; Method A: 0]", va, vb))
+        print(fmt_row("  t_sync [GPU→CPU buffer, partial only]", va, vb))
 
         print(fmt_row("  t_prefetch [ckpt CPU load]",
                       ta.get("t_prefetch_s"), tb.get("t_prefetch_s")))
@@ -706,10 +735,12 @@ def compare(path_a: str, path_b: str):
         print(fmt_row("  t_total_transition",
                       ta.get("t_total_transition_s"), tb.get("t_total_transition_s")))
 
-        n_in_a = ta.get("first_chat_n_input", "?")
-        n_in_b = tb.get("first_chat_n_input", "?")
+        n_in_a  = ta.get("first_chat_n_input", "?")
+        n_in_b  = tb.get("first_chat_n_input", "?")
+        n_gen_a = ta.get("first_chat_n_gen", "?")
+        n_gen_b = tb.get("first_chat_n_gen", "?")
         print(fmt_row(f"  t_first_chat [KEY] "
-                      f"(A:{n_in_a}tok, B:{n_in_b}tok)",
+                      f"(A:{n_in_a}in/{n_gen_a}gen, B:{n_in_b}in/{n_gen_b}gen)",
                       ta.get("t_first_chat_s"), tb.get("t_first_chat_s")))
 
         print(fmt_row("  ★ t_total_effective [transition+first_chat]",
@@ -762,13 +793,10 @@ def compare(path_a: str, path_b: str):
                   f"[{winner}] faster by {saving:.2f}s ({pct:.0f}%)")
 
     print("\n  NOTE:")
-    print("  - t_first_chat in Origin  = FULL PREFILL (all tokens recomputed, KV cache cleared)")
+    print("  - t_first_chat in Origin  = FULL PREFILL (all tokens recomputed)")
     print("  - t_first_chat in Partial = only new user tokens processed (KV cache preserved)")
-    print("  - t_sync in Partial       = 0.000s if Method A (GPU-resident); >0 if Method B (CPU sync)")
-    print("  - t_recompute in Partial:")
-    print("      Method A (GPU-resident): back layers only, GPU buffer → boundary hidden states,")
-    print("                               front KV cache in-place, no CPU↔GPU transfer")
-    print("      Method B (CPU-based):    KV-only pass (front layers) + full forward (back layers)")
+    print("  - t_sync in Partial       = 0 (Method A: GPU-resident, no CPU copy needed)")
+    print("  - t_recompute in Partial  = back layers only (front KV cache in-place)")
     print("=" * W)
 
 

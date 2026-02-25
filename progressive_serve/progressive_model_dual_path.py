@@ -129,6 +129,12 @@ class ProgressiveModelDualPath(nn.Module):
         self._persistent_r_buffers: List[torch.Tensor] = []
         self._persistent_buffers_initialized = False
 
+        # ── Pinned Staging Buffer (weight copy 최적화) ──
+        # 최초 1회 할당(~16s)으로 이후 모든 prefetch에서 CPU-CPU 복사만 사용.
+        # pin_memory()를 매 prefetch마다 호출하면 매번 ~16s 소요되므로,
+        # 미리 할당해두고 재사용함으로써 2회차 이후 prefetch가 ~0.1s로 단축됨.
+        self._pinned_staging_buffer: Optional[torch.Tensor] = None
+
         print(f"✅ Initialized ProgressiveModelDualPath for: {self.model_type}")
         print(f"✅ Layer forward mode: {self._layer_forward_mode}")
     
@@ -873,13 +879,40 @@ class ProgressiveModelDualPath(nn.Module):
         self._prefetch_path = checkpoint_path
         self._prefetch_event = threading.Event()
 
+        # Staging buffer 최초 1회 할당 (동기, 메인 스레드에서 수행).
+        # 첫 호출: ~16s (page registration). 이후 호출: 0s (기존 버퍼 재사용).
+        # chatbot_partial_cache.py에서 prefetch_stage2()가 Stage 1 시작 직후 호출되므로
+        # 실서비스에서는 이 비용이 Stage 1 서빙과 겹치지 않고 startup 시점에 처리됨.
+        size_bytes = os.path.getsize(checkpoint_path)
+        needed_numel = int(size_bytes * 1.2) // 2  # fp16 기준, 20% 여유
+        if self._pinned_staging_buffer is None or \
+                self._pinned_staging_buffer.numel() < needed_numel:
+            gb = needed_numel * 2 / 1e9
+            print(f"[Prefetch] Allocating {gb:.2f} GB pinned staging buffer (one-time)...")
+            self._pinned_staging_buffer = torch.empty(
+                needed_numel, dtype=torch.float16
+            ).pin_memory()
+            print(f"[Prefetch] ✅ Pinned staging buffer allocated ({gb:.2f} GB)")
+
         def _worker():
             try:
                 print(f"[Prefetch] Loading {checkpoint_path} in background...")
                 state_dict = load_file(checkpoint_path)
-                state_dict = {k: v.pin_memory() for k, v in state_dict.items()}
-                self._prefetch_buffer = state_dict
-                print(f"[Prefetch] ✅ {len(state_dict)} tensors ready in CPU pinned memory")
+
+                # 이미 pin된 staging buffer로 CPU-CPU 복사 (빠름: ~0.1s)
+                offset = 0
+                pinned_dict = {}
+                for k, v in state_dict.items():
+                    v_fp16 = v if v.dtype == torch.float16 else v.half()
+                    n = v_fp16.numel()
+                    self._pinned_staging_buffer[offset : offset + n].copy_(v_fp16.view(-1))
+                    pinned_dict[k] = (
+                        self._pinned_staging_buffer[offset : offset + n].view(v_fp16.shape)
+                    )
+                    offset += n
+
+                self._prefetch_buffer = pinned_dict
+                print(f"[Prefetch] ✅ {len(pinned_dict)} tensors in pinned staging buffer")
             except Exception as e:
                 print(f"[Prefetch] ❌ Failed: {e}")
                 self._prefetch_buffer = None

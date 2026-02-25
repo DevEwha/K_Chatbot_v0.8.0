@@ -30,7 +30,7 @@ from progressive_for_causal_lm import ProgressiveForCausalLM
 import json
 
 MODELS = {
-    "llama":   "/acpl-ssd30/7b_results/pruning/A",
+    "llama":   "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/A",
     "mistral": "/home/devewha/entropy_routing/25_mistral_results/pruning/A",
     "qwen":    "/path/to/qwen2-7b",
     "gemma":   "/path/to/gemma-7b",
@@ -118,7 +118,7 @@ print(f"Progress: {stage_info['activation_progress']}")
 
 # 각 모델별 checkpoint 경로 설정
 STAGE_B_CHECKPOINTS = {
-    "llama": "/acpl-ssd30/7b_results/pruning/checkpoints/stage2_layers_B.safetensors",
+    "llama": "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/checkpoints/stage2_layers_B.safetensors",
     "mistral": "/acpl-ssd30/25_mistral_results/pruning/bundles/stage2_layers_B.safetensors",
     "qwen": "/path/to/qwen/layer_B.safetensors",
     # ... 다른 모델들 ...
@@ -163,7 +163,7 @@ if MODEL_NAME in STAGE_B_CHECKPOINTS:
 # ============================================================================
 
 STAGE_C_CHECKPOINTS = {
-    "llama": "/acpl-ssd30/7b_results/pruning/checkpoints/stage3_layers_C.safetensors",
+    "llama": "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/checkpoints/stage3_layers_C.safetensors",
     "mistral": "/acpl-ssd30/25_mistral_results/pruning/bundles/stage3_layers_C.safetensors",
     "qwen": "/path/to/qwen/layer_C.safetensors",
     # ... 다른 모델들 ...

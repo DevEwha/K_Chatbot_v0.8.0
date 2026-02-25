@@ -50,9 +50,9 @@ from progressive_for_causal_lm import ProgressiveForCausalLM
 
 MODELS = {
     "llama": {
-        "progressive_path": "/acpl-ssd30/7b_results/pruning/A",
-        "stage_b_checkpoint": "/acpl-ssd30/7b_results/pruning/checkpoints/stage2_layers_B.safetensors",
-        "stage_c_checkpoint": "/acpl-ssd30/7b_results/pruning/checkpoints/stage3_layers_C.safetensors",
+        "progressive_path": "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/A",
+        "stage_b_checkpoint": "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/checkpoints/stage2_layers_B.safetensors",
+        "stage_c_checkpoint": "/home/devewha/K_Chatbot_v0.8.0/models/7b_results/pruning/checkpoints/stage3_layers_C.safetensors",
     },
     "mistral": {
         "progressive_path": "/home/devewha/entropy_routing/25_mistral_results/pruning/A",

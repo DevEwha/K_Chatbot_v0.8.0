@@ -69,11 +69,30 @@ MODELS = {
 # 고정 대화 스크립트 (두 모드에 동일하게 적용)
 # ============================================================================
 
-# Stage 1에서 3번 대화 (KV cache 누적)
+# Stage 1에서 20번 대화 (KV cache 누적 — partial 모드 t_ttft 이점 검증용)
+# 응답 길이: 턴 1-3은 ~80 tok, 턴 4-20은 ~45 tok (2048 한도 내 수납)
+# 예상 누적 토큰: 턴 20 입력 시점 ~1500 tok → TTFT 측정용 컨텍스트 충분
 STAGE1_PROMPTS = [
     "Tell me about the history of computing briefly.",
     "What were the key innovations of the 1970s in computing?",
     "How did personal computers change society?",
+    "What role did the internet play in transforming computing?",
+    "How did smartphones change our relationship with technology?",
+    "What is cloud computing and why do companies adopt it?",
+    "How do modern processors differ from those of the 1980s?",
+    "What is open source software and how did it reshape the industry?",
+    "How did video games drive hardware innovation?",
+    "What is artificial intelligence at its core?",
+    "How does machine learning differ from traditional programming?",
+    "What is a neural network and how does it process information?",
+    "How do search engines index and retrieve information?",
+    "What makes cybersecurity so challenging today?",
+    "How has computing transformed medical imaging?",
+    "What is the significance of Moore's Law slowing down?",
+    "How do databases enable modern applications?",
+    "What role do programming languages play in software development?",
+    "How has computing affected scientific discovery?",
+    "What computing breakthroughs do you expect in the next decade?",
 ]
 
 # Stage 1 고정 응답 (두 모드에서 동일한 conversation history 보장)
@@ -81,19 +100,108 @@ STAGE1_PROMPTS = [
 # Stage 2/3 진입 시점의 KV cache token 수가 동일해져 t_first_chat 비교가 공정해짐.
 # None으로 설정하면 실제 모델 응답 사용 (기존 동작, t_first_chat 비교 신뢰도 낮음)
 STAGE1_FIXED_RESPONSES = [
+    # Turn 1 (~80 tok)
     "Computing history spans from mechanical calculators in the 1800s to modern processors. "
     "Key milestones include Turing's theoretical work, ENIAC in 1945, transistors replacing "
     "vacuum tubes, integrated circuits enabling miniaturization, and the microprocessor "
     "revolution of the 1970s leading to personal computers.",
 
+    # Turn 2 (~80 tok)
     "The 1970s saw the microprocessor (Intel 4004, 8080), the birth of Microsoft and Apple, "
     "the Altair 8800 kit computer, Ethernet networking by Xerox PARC, and the CP/M operating "
     "system. These innovations democratized computing and laid the foundation for the PC era.",
 
+    # Turn 3 (~60 tok)
     "Personal computers transformed society by bringing computing into homes and offices, "
     "enabling word processing, spreadsheets, and desktop publishing. They created new industries, "
     "changed education, and eventually connected billions through the internet, reshaping how "
     "people work, communicate, and access information.",
+
+    # Turn 4 (~45 tok)
+    "The internet connected computers worldwide via TCP/IP protocols, enabling email, web browsing, "
+    "and e-commerce. Tim Berners-Lee's World Wide Web in 1991 made it accessible, transforming "
+    "computing from isolated workstations to a global information network.",
+
+    # Turn 5 (~45 tok)
+    "Smartphones merged phone, camera, GPS, and computer into one device, making computing "
+    "continuous and ubiquitous. Touchscreens replaced keyboards, app stores created new software "
+    "markets, and mobile internet shifted web usage from desktops to pockets.",
+
+    # Turn 6 (~45 tok)
+    "Cloud computing provides computing resources over the internet on demand, eliminating local "
+    "hardware investment. Companies adopt it for scalability, cost flexibility, and outsourced "
+    "maintenance, enabling startups to access enterprise-grade infrastructure immediately.",
+
+    # Turn 7 (~45 tok)
+    "Modern processors contain billions of transistors versus millions in the 1980s, with multiple "
+    "cores enabling parallel execution. Cache hierarchies, out-of-order execution, and SIMD "
+    "instructions deliver performance thousands of times greater than early chips.",
+
+    # Turn 8 (~45 tok)
+    "Open source releases code publicly for anyone to use and modify. Linux, Apache, and Python "
+    "became foundational infrastructure, shifting power from proprietary vendors to communities "
+    "and enabling collaborative development at global scale.",
+
+    # Turn 9 (~45 tok)
+    "Games demanded faster processors and dedicated graphics chips, pushing hardware companies to "
+    "innovate rapidly. GPU technology created for real-time rendering now powers AI training, "
+    "scientific simulation, and cryptocurrency mining far beyond gaming.",
+
+    # Turn 10 (~45 tok)
+    "AI creates systems exhibiting intelligent behavior by learning patterns from data rather than "
+    "following explicit rules. It encompasses machine learning, computer vision, and natural "
+    "language processing, enabling computers to recognize speech, images, and complex patterns.",
+
+    # Turn 11 (~45 tok)
+    "Traditional programming specifies exact rules; machine learning discovers rules automatically "
+    "from training data. Engineers provide examples and loss functions, and algorithms optimize "
+    "parameters to minimize prediction errors without explicit rule coding.",
+
+    # Turn 12 (~45 tok)
+    "Neural networks consist of layers of interconnected nodes inspired by neurons. Input passes "
+    "through weighted connections; each layer transforms representations until output emerges. "
+    "Training adjusts weights via backpropagation to minimize loss across datasets.",
+
+    # Turn 13 (~45 tok)
+    "Search engines crawl web pages using bots, store text in inverted indexes, then rank results "
+    "using relevance algorithms. Modern engines combine semantic understanding, query intent "
+    "modeling, and user behavior signals alongside traditional keyword matching.",
+
+    # Turn 14 (~45 tok)
+    "Attackers exploit software vulnerabilities and human psychology at global scale, while "
+    "defenders must protect every entry point. Sophisticated ransomware, supply chain attacks, "
+    "and nation-state actors compound the challenge of modern cybersecurity.",
+
+    # Turn 15 (~45 tok)
+    "CT scanners and MRI machines generate digital images analyzed by deep learning models "
+    "detecting tumors and anomalies with high accuracy. AI now assists radiologists, enabling "
+    "earlier disease detection and reducing diagnostic errors in medical practice.",
+
+    # Turn 16 (~45 tok)
+    "Moore's Law predicted transistor counts doubling every two years, driving consistent "
+    "performance gains. As miniaturization approaches physical limits, progress now requires "
+    "multi-core designs, specialized accelerators like GPUs and TPUs, and new architectures.",
+
+    # Turn 17 (~45 tok)
+    "Databases provide structured persistent storage with query capabilities, enabling reliable "
+    "data retrieval. SQL databases enforce consistency through ACID transactions; NoSQL alternatives "
+    "trade consistency for scalability, handling billions of records across distributed systems.",
+
+    # Turn 18 (~45 tok)
+    "Programming languages bridge human thinking and machine execution. High-level languages like "
+    "Python prioritize readability; systems languages like Rust emphasize performance and safety. "
+    "Language choice affects developer productivity and application reliability.",
+
+    # Turn 19 (~45 tok)
+    "Simulations now complement experimentation, modeling climate, protein folding, and particle "
+    "physics computationally. High-performance clusters process telescope and accelerator data "
+    "too vast for human analysis, enabling discoveries previously inaccessible to science.",
+
+    # Turn 20 (~45 tok)
+    "Expected breakthroughs include practical quantum advantage for optimization and simulation, "
+    "neuromorphic chips mimicking brain architecture, and widespread AI integration in software "
+    "development. Memory-centric architectures addressing bandwidth bottlenecks may define "
+    "the next computing era.",
 ]
 
 # Stage 2에서 사용할 질문들 (첫 번째 = transition 직후 첫 채팅)
@@ -465,7 +573,7 @@ def run_origin(model_name: str, output_path: str):
         model=model_path,
         trust_remote_code=True,
         gpu_memory_utilization=0.4,
-        max_model_len=2048,
+        max_model_len=4096,
         enforce_eager=False,
         enable_prefix_caching=True,
     )
@@ -590,7 +698,7 @@ def run_partial(model_name: str, output_path: str):
         model=model_path,
         trust_remote_code=True,
         gpu_memory_utilization=0.4,
-        max_model_len=2048,
+        max_model_len=4096,
         enforce_eager=False,
         enable_prefix_caching=True,
     )

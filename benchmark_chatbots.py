@@ -299,14 +299,26 @@ def _measure_transition_origin(llm, model, tokenizer, config, stage_key,
           f"t_transition={tr['t_total_transition_s']:.3f}s")
     print(f"    → [First chat] FULL PREFILL (KV cache cleared)...")
 
+    # t_ttft: Time To First Token = pure prefill cost (max_tokens=1)
+    ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
+    conv_with_q = list(conversation) + [{"role": "user", "content": first_prompt}]
+    prompt_ttft = build_prompt(tokenizer, conv_with_q)
+    n_ttft = len(tokenizer.encode(prompt_ttft))
+    torch.cuda.synchronize()
+    t0 = time.time()
+    llm.generate([prompt_ttft], ttft_params)
+    torch.cuda.synchronize()
+    tr["t_ttft_s"] = round(time.time() - t0, 3)
+    print(f"    → [TTFT] {tr['t_ttft_s']:.3f}s  ({n_ttft} tok, full prefill)")
+
     r_first = do_chat(llm, tokenizer, conversation, first_prompt, sampling_params)
     tr["t_first_chat_s"]     = r_first["t_chat_s"]
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
     tr["first_chat_n_gen"]    = r_first["n_gen_tokens"]
-    tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_first_chat_s"], 3)
+    tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_ttft_s"], 3)
 
     print(f"    → t_first_chat={tr['t_first_chat_s']:.3f}s  "
-          f"t_total_effective={tr['t_total_effective_s']:.3f}s")
+          f"t_total_effective(+ttft)={tr['t_total_effective_s']:.3f}s")
 
     return tr
 
@@ -384,15 +396,27 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
           f"t_transition={tr['t_total_transition_s']:.3f}s")
     print(f"    → [First chat] KV already updated (should be fast)...")
 
+    # t_ttft: Time To First Token = pure prefill cost (max_tokens=1)
+    ttft_params = SamplingParams(temperature=0.0, max_tokens=1)
+    conv_with_q = list(conversation) + [{"role": "user", "content": first_prompt}]
+    prompt_ttft = build_prompt(tokenizer, conv_with_q)
+    n_ttft = len(tokenizer.encode(prompt_ttft))
+    torch.cuda.synchronize()
+    t0 = time.time()
+    llm.generate([prompt_ttft], ttft_params)
+    torch.cuda.synchronize()
+    tr["t_ttft_s"] = round(time.time() - t0, 3)
+    print(f"    → [TTFT] {tr['t_ttft_s']:.3f}s  ({n_ttft} tok, only new tokens prefilled)")
+
     # 첫 채팅 (KV 이미 partial recompute 완료 → 새 user 입력만 처리)
     r_first = do_chat(llm, tokenizer, conversation, first_prompt, sampling_params)
     tr["t_first_chat_s"]     = r_first["t_chat_s"]
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
     tr["first_chat_n_gen"]    = r_first["n_gen_tokens"]
-    tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_first_chat_s"], 3)
+    tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_ttft_s"], 3)
 
     print(f"    → t_first_chat={tr['t_first_chat_s']:.3f}s  "
-          f"t_total_effective={tr['t_total_effective_s']:.3f}s")
+          f"t_total_effective(+ttft)={tr['t_total_effective_s']:.3f}s")
 
     return tr
 
@@ -739,11 +763,14 @@ def compare(path_a: str, path_b: str):
         n_in_b  = tb.get("first_chat_n_input", "?")
         n_gen_a = ta.get("first_chat_n_gen", "?")
         n_gen_b = tb.get("first_chat_n_gen", "?")
-        print(fmt_row(f"  t_first_chat [KEY] "
+        print(fmt_row("  ★ t_ttft [PREFILL ONLY, max_tokens=1]",
+                      ta.get("t_ttft_s"), tb.get("t_ttft_s")))
+
+        print(fmt_row(f"  t_first_chat [ref] "
                       f"(A:{n_in_a}in/{n_gen_a}gen, B:{n_in_b}in/{n_gen_b}gen)",
                       ta.get("t_first_chat_s"), tb.get("t_first_chat_s")))
 
-        print(fmt_row("  ★ t_total_effective [transition+first_chat]",
+        print(fmt_row("  ★ t_total_effective [transition+t_ttft]",
                       ta.get("t_total_effective_s"), tb.get("t_total_effective_s")))
 
     print_transition("Stage 1 → 2 Transition",
@@ -776,7 +803,7 @@ def compare(path_a: str, path_b: str):
 
     # ── 핵심 요약 ──
     print("\n" + "=" * W)
-    print("  ★ KEY INSIGHT (t_total_effective = transition + first_chat)")
+    print("  ★ KEY INSIGHT (t_total_effective = transition + t_ttft)")
     print(f"  {'Transition':<20}  {'A':>10}  {'B':>10}  Winner")
     print(f"  {'-'*20}  {'-'*10}  {'-'*10}  {'-'*8}")
 
@@ -793,10 +820,11 @@ def compare(path_a: str, path_b: str):
                   f"[{winner}] faster by {saving:.2f}s ({pct:.0f}%)")
 
     print("\n  NOTE:")
-    print("  - t_first_chat in Origin  = FULL PREFILL (all tokens recomputed)")
-    print("  - t_first_chat in Partial = only new user tokens processed (KV cache preserved)")
-    print("  - t_sync in Partial       = 0 (Method A: GPU-resident, no CPU copy needed)")
-    print("  - t_recompute in Partial  = back layers only (front KV cache in-place)")
+    print("  - t_ttft = Time To First Token (max_tokens=1, prefill only)")
+    print("      Origin:  full prefill of ALL tokens (history + new question)")
+    print("      Partial: only new question tokens prefilled (history KV cache preserved)")
+    print("  - t_first_chat = full generation time (decode dominated, less informative for comparison)")
+    print("  - t_total_effective = transition + t_ttft (user-perceived latency, prefill-fair)")
     print("=" * W)
 
 

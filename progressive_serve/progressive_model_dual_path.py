@@ -877,8 +877,9 @@ class ProgressiveModelDualPath(nn.Module):
             try:
                 print(f"[Prefetch] Loading {checkpoint_path} in background...")
                 state_dict = load_file(checkpoint_path)
+                state_dict = {k: v.pin_memory() for k, v in state_dict.items()}
                 self._prefetch_buffer = state_dict
-                print(f"[Prefetch] ✅ {len(state_dict)} tensors ready in CPU memory")
+                print(f"[Prefetch] ✅ {len(state_dict)} tensors ready in CPU pinned memory")
             except Exception as e:
                 print(f"[Prefetch] ❌ Failed: {e}")
                 self._prefetch_buffer = None
@@ -1049,7 +1050,7 @@ class ProgressiveModelDualPath(nn.Module):
             
             # 일반 weights (direct match)
             if name in layer_weights:
-                param.data.copy_(layer_weights[name].to(device))
+                param.data.copy_(layer_weights[name], non_blocking=True)
                 loaded_count += 1
         
         return loaded_count
@@ -1074,12 +1075,13 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            fused_weight = torch.cat([
-                layer_weights[name] for name in weight_names
-            ], dim=0)
-            
-            param.data.copy_(fused_weight.to(device))
-            print(f"  ✅ Loaded fused QKV ({len(weight_names)} weights)")
+            offset = 0
+            for name in weight_names:
+                t = layer_weights[name]
+                n = t.shape[0]
+                param.data[offset : offset + n].copy_(t, non_blocking=True)
+                offset += n
+            print(f"  ✅ Loaded fused QKV ({len(weight_names)} weights → {offset} rows)")
             return True
         
         return False
@@ -1106,12 +1108,13 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            fused_weight = torch.cat([
-                layer_weights[name] for name in weight_names
-            ], dim=0)
-            
-            param.data.copy_(fused_weight.to(device))
-            print(f"  ✅ Loaded fused MLP ({len(weight_names)} weights)")
+            offset = 0
+            for name in weight_names:
+                t = layer_weights[name]
+                n = t.shape[0]
+                param.data[offset : offset + n].copy_(t, non_blocking=True)
+                offset += n
+            print(f"  ✅ Loaded fused MLP ({len(weight_names)} weights → {offset} rows)")
             return True
         
         return False

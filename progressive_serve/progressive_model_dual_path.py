@@ -315,12 +315,18 @@ class ProgressiveModelDualPath(nn.Module):
         mem_mb = num_layers * max_seq_len * hidden_dim * 2 * 2 / (1024**2)
         print(f"✅ Persistent GPU buffers: {num_layers} layers × {max_seq_len} seq = {mem_mb:.0f} MB")
 
+    # ----------------------------------------------------------------
+    # Persistent Buffer → GPU Cache 동기화 (CPU 전송 제거)
+    # ----------------------------------------------------------------
     def sync_persistent_cache(self, seq_len: int):
         """
-        GPU persistent buffer → CPU _layer_output_cache
-
-        Stage 전환 직전에 chatbot에서 호출.
-        GPU buffer의 [0:seq_len] 구간을 CPU로 복사하여 partial recompute에 사용.
+        GPU persistent buffer의 현재 상태를 스냅샷하여 _layer_output_cache에 저장.
+        
+        [최적화 내용]
+        - 기존의 .cpu() 호출을 제거하여 악명 높은 PCIe 대역폭 병목(D2H)을 없앴습니다.
+        - 대신 GPU 내에서 .clone()을 사용하여 빠르게 복사합니다.
+        - clone()을 사용하는 이유는 partial recompute 도중 버퍼에 in-place 기록이 
+          발생하여 참조가 꼬이는 것을 방지하기 위함입니다 (VRAM to VRAM 복사는 1ms 이하로 매우 빠름).
         """
         if not self._persistent_buffers_initialized:
             print(f"[Cache] ⚠️ Persistent buffers not initialized")
@@ -329,12 +335,34 @@ class ProgressiveModelDualPath(nn.Module):
         max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
 
         self._layer_output_cache.clear()
+        
+        # GPU 내에서 바로 슬라이싱 및 복제 수행
         for layer_idx in range(max_layer + 1):
-            h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
-            r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
+            h = self._persistent_h_buffers[layer_idx][:seq_len].clone()
+            r = self._persistent_r_buffers[layer_idx][:seq_len].clone()
             self._layer_output_cache[layer_idx] = {"output": (h, r)}
 
-        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
+        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU-only, No CPU transfer)")
+    # def sync_persistent_cache(self, seq_len: int):
+    #     """
+    #     GPU persistent buffer → CPU _layer_output_cache
+
+    #     Stage 전환 직전에 chatbot에서 호출.
+    #     GPU buffer의 [0:seq_len] 구간을 CPU로 복사하여 partial recompute에 사용.
+    #     """
+    #     if not self._persistent_buffers_initialized:
+    #         print(f"[Cache] ⚠️ Persistent buffers not initialized")
+    #         return
+
+    #     max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
+
+    #     self._layer_output_cache.clear()
+    #     for layer_idx in range(max_layer + 1):
+    #         h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
+    #         r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
+    #         self._layer_output_cache[layer_idx] = {"output": (h, r)}
+
+    #     print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
 
     def clear_persistent_buffers(self):
         """Persistent buffer 초기화 (warmup 데이터 제거)"""

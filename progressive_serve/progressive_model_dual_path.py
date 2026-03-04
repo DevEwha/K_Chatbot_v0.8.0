@@ -12,6 +12,7 @@ import importlib
 import threading
 import inspect
 import os
+import time
 import torch
 import torch.nn as nn
 import sys
@@ -108,13 +109,18 @@ class ProgressiveModelDualPath(nn.Module):
 
         self.current_adapter = None
 
-        # ── Partial KV Recomputation ──
-        # layer_idx → {"output": (hidden_states_cpu, residual_cpu)}
+        # ── Partial KV Recomputation (fallback) ──
+        # layer_idx → {"output": (hidden_states_gpu, residual_gpu)}
         self._layer_output_cache: Dict[int, Any] = {}
         # None이면 일반 forward, 정수면 해당 layer부터 full forward
         self._partial_recompute_boundary: Optional[int] = None
         # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
         self._max_cacheable_layer: Optional[int] = None
+
+        # ── KV Block Surgery ──
+        # Decode 단계에서 저장: full sequence의 physical block mapping
+        self._surgery_block_tables: Optional[torch.Tensor] = None  # [1, max_blocks]
+        self._surgery_seq_lens_tensor: Optional[torch.Tensor] = None  # [1]
 
         # ── Persistent GPU Buffers (CUDA graph safe) ──
         # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
@@ -403,6 +409,29 @@ class ProgressiveModelDualPath(nn.Module):
         - All operations on GPU tensors
         """
 
+        # ── KV Surgery: block_tables 추적 ──
+        # CUDA graph 호환: clone() 대신 view 저장
+        #   - CUDA graph 캡처 시: Python forward() 실행 → view 저장
+        #   - CUDA graph replay 시: prepare_graph_input_buffers()가 원본 텐서 in-place 업데이트
+        #     → view가 자동으로 최신 값 반영 (라이브 포인터)
+        #   - Eager 모드 시: 매 step마다 forward() 실행 → view 갱신
+        # 주의: clone() 사용 시 CUDA graph 캡처 시점의 dummy 값이 고정됨 → 버그!
+        try:
+            from vllm.forward_context import get_forward_context as _get_fwd_ctx
+            _fwd_meta = _get_fwd_ctx().attn_metadata
+            if (_fwd_meta is not None
+                    and getattr(_fwd_meta, 'num_decode_tokens', 0) > 0
+                    and getattr(_fwd_meta, 'block_tables', None) is not None
+                    and _fwd_meta.block_tables.numel() > 0
+                    and getattr(_fwd_meta, 'seq_lens_tensor', None) is not None
+                    and _fwd_meta.seq_lens_tensor.numel() > 0):
+                # view (not clone): 원본 텐서와 동일한 메모리 공유
+                # → CUDA graph replay 전 prepare_graph_input_buffers()가 원본 업데이트 시 자동 반영
+                self._surgery_block_tables = _fwd_meta.block_tables[:1]
+                self._surgery_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
+        except Exception:
+            pass
+
         # Embedding
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -636,7 +665,178 @@ class ProgressiveModelDualPath(nn.Module):
         """Hidden state 캐시 초기화"""
         self._layer_output_cache.clear()
         self._partial_recompute_boundary = None
-    
+
+    # ================================================================
+    # True KV Block Surgery
+    # ================================================================
+
+    def inject_upper_layer_kv(
+        self,
+        boundary: int,
+        seq_len: Optional[int] = None,
+    ) -> bool:
+        """
+        Stage 전환 시 upper layer KV만 업데이트하는 진짜 KV block surgery.
+
+        원리:
+        - Lower layers (0..boundary-1): 가중치 동일 → KV 불변 → 손대지 않음
+        - Upper layers (boundary..N-1): 새 가중치로 forward → 동일 physical block에 덮어씀
+        - vLLM prefix cache hash→block 매핑 유지 → 다음 generate()에서 full prefix hit!
+        - 결과: 다음 generate()에서 prefill 완전 스킵
+
+        Returns:
+            True: surgery 성공
+            False: 실패 (호출자가 reset_prefix_cache + partial recompute로 fallback)
+        """
+        if not self._persistent_buffers_initialized:
+            print("[Surgery] ❌ Persistent buffers not initialized")
+            return False
+
+        if self._surgery_block_tables is None:
+            print("[Surgery] ❌ No block tables saved (no decode step happened yet)")
+            return False
+
+        # seq_len 결정
+        if seq_len is None:
+            if self._surgery_seq_lens_tensor is None:
+                print("[Surgery] ❌ No seq_lens_tensor saved")
+                return False
+            seq_len = int(self._surgery_seq_lens_tensor[0].item())
+
+        if seq_len < 1:
+            print(f"[Surgery] ❌ Invalid seq_len={seq_len}")
+            return False
+
+        if boundary <= 0 or boundary >= len(self.layers):
+            print(f"[Surgery] ❌ Invalid boundary {boundary} for {len(self.layers)} layers")
+            return False
+
+        device = self._persistent_h_buffers[0].device
+        block_size = self.vllm_config.cache_config.block_size
+        num_blocks_needed = (seq_len + block_size - 1) // block_size
+
+        if self._surgery_block_tables.shape[1] < num_blocks_needed:
+            print(f"[Surgery] ❌ Not enough blocks: have {self._surgery_block_tables.shape[1]}, "
+                  f"need {num_blocks_needed} for seq_len={seq_len}")
+            return False
+
+        print(f"\n[Surgery] 🔪 KV block surgery starting")
+        print(f"  Lower layers 0~{boundary-1}: KV 보존 (가중치 동일, 연산 없음)")
+        print(f"  Upper layers {boundary}~{len(self.layers)-1}: 새 가중치로 KV 재계산")
+        print(f"  Seq len: {seq_len} tokens | Blocks: {num_blocks_needed}")
+
+        # block_tables에서 slot_mapping 재구성
+        try:
+            slot_mapping = self._reconstruct_slot_mapping(
+                self._surgery_block_tables[:1, :num_blocks_needed],
+                seq_len, block_size, device,
+            )
+        except Exception as e:
+            print(f"[Surgery] ❌ slot_mapping 재구성 실패: {e}")
+            return False
+
+        # boundary-1 레이어의 출력 = boundary 레이어의 입력
+        h = self._persistent_h_buffers[boundary - 1][:seq_len].clone()
+        r = self._persistent_r_buffers[boundary - 1][:seq_len].clone()
+
+        positions = torch.arange(seq_len, device=device, dtype=torch.long)
+
+        # Surgery용 FlashAttentionMetadata 구성
+        # context_lens_tensor=zeros → 전체 seq_len 토큰을 fresh prefill로 처리
+        # → K,V cache write + full causal attention 계산
+        try:
+            from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+
+            surgery_meta = FlashAttentionMetadata(
+                num_prefills=1,
+                num_prefill_tokens=seq_len,
+                num_decode_tokens=0,
+                slot_mapping=slot_mapping,
+                multi_modal_placeholder_index_maps=None,
+                enable_kv_scales_calculation=False,
+                seq_lens=[seq_len],
+                seq_lens_tensor=torch.tensor(
+                    [seq_len], device=device, dtype=torch.int32),
+                max_prefill_seq_len=seq_len,
+                max_decode_seq_len=0,
+                context_lens_tensor=torch.zeros(
+                    1, dtype=torch.int32, device=device),
+                block_tables=self._surgery_block_tables[:1, :num_blocks_needed],
+                use_cuda_graph=False,
+                max_query_len=seq_len,
+                query_start_loc=torch.tensor(
+                    [0, seq_len], device=device, dtype=torch.int32),
+                seq_start_loc=torch.tensor(
+                    [0, seq_len], device=device, dtype=torch.int32),
+                max_decode_query_len=0,
+            )
+        except Exception as e:
+            print(f"[Surgery] ❌ Metadata 생성 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        # Upper layers를 surgery ForwardContext 안에서 직접 실행
+        t0 = time.perf_counter()
+        try:
+            from vllm.forward_context import set_forward_context
+            with torch.inference_mode():
+                with set_forward_context(
+                    surgery_meta, self.vllm_config, virtual_engine=0
+                ):
+                    for layer_idx in range(boundary, len(self.layers)):
+                        layer_wrapper = self.layers[layer_idx]
+                        alpha = layer_wrapper.get_alpha()
+
+                        # Full layer forward: attention이 slot_mapping으로 KV 쓰기 수행
+                        hidden_a, residual_a = self._call_layer_forward_fast(
+                            layer_wrapper.layer,
+                            positions=positions,
+                            hidden_states=h,
+                            residual=r,
+                        )
+
+                        hidden_b = h
+                        residual_b = r
+
+                        h = alpha * hidden_a + (1.0 - alpha) * hidden_b
+
+                        if residual_a is not None and residual_b is not None:
+                            r = alpha * residual_a + (1.0 - alpha) * residual_b
+                        elif residual_a is not None:
+                            r = alpha * residual_a
+                        else:
+                            r = residual_b
+
+        except Exception as e:
+            print(f"[Surgery] ❌ Surgery forward 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        print(f"  ✅ KV surgery 완료 ({elapsed_ms:.1f} ms)")
+        print(f"  📌 Lower (0~{boundary-1}): KV 그대로 (재계산 없음)")
+        print(f"  📌 Upper ({boundary}~{len(self.layers)-1}): KV 업데이트됨")
+        print(f"  📌 Prefix cache 유지 → 다음 generate()에서 prefill 스킵\n")
+
+        return True
+
+    def _reconstruct_slot_mapping(
+        self,
+        block_tables: torch.Tensor,  # [1, num_blocks]
+        seq_len: int,
+        block_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """block_tables + seq_len → flat slot_mapping [seq_len] 재구성."""
+        token_indices = torch.arange(seq_len, dtype=torch.long, device=device)
+        logical_blocks = token_indices // block_size
+        offsets = token_indices % block_size
+        physical_blocks = block_tables[0, logical_blocks]
+        return physical_blocks * block_size + offsets
+
     def _call_layer_forward_fast(
         self,
         layer,

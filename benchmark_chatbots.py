@@ -22,8 +22,8 @@ Usage:
             → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
             → t_total_effective = transition + first_chat
 
-  [Partial] t_prefetch | t_activation | t_surgery (~20ms, KV block surgery)
-            → t_total_transition (surgery 포함, 빠름)
+  [Partial] t_sync | t_prefetch | t_activation | t_surgery (~20ms, KV block surgery)
+            → t_total_transition (sync+surgery 포함, 빠름)
             → t_first_chat  ← KV 이미 업데이트됨, prefix cache 유지 (빠름)
             → t_total_effective = transition + first_chat
 
@@ -587,7 +587,7 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     """
     Partial 모드 stage 전환 타이밍 측정 (KV Block Surgery).
 
-    단계: prefetch → activation → KV block surgery (~20ms)
+    단계: sync → prefetch → activation → KV block surgery (~20ms)
     이후: 첫 채팅 (prefix cache 유지 → prefill 스킵 → 빠름)
     """
     tr = {}
@@ -597,9 +597,22 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     prefetch_fn = getattr(model, prefetch_fn_name)
     advance_fn  = getattr(model, advance_fn_name)
 
-    # t_sync: 구 partial recompute 방식에서 사용하던 GPU→CPU 동기화.
-    # Surgery는 GPU persistent buffer를 직접 사용하므로 불필요. 0으로 기록.
-    tr["t_sync_s"] = 0.0
+    # t_sync: GPU persistent buffer → _layer_output_cache (surgery fallback용)
+    # chatbot에서 prefetch 시작 전 동기적으로 호출되므로 실제 전환 비용에 포함됨.
+    # surgery 성공 시에는 cache가 사용되지 않지만, 항상 준비해두는 것이 실제 동작.
+    torch.cuda.synchronize()
+    t0 = time.time()
+    inner_model = getattr(model, "model", None)
+    if inner_model is not None and hasattr(inner_model, "sync_persistent_cache"):
+        seq_len = 0
+        if (getattr(inner_model, "_surgery_seq_lens_tensor", None) is not None
+                and inner_model._surgery_seq_lens_tensor.numel() > 0):
+            seq_len = int(inner_model._surgery_seq_lens_tensor[0].item())
+        if seq_len > 0:
+            print(f"    → [Sync] Caching {seq_len} tokens for surgery fallback...")
+            inner_model.sync_persistent_cache(seq_len)
+    torch.cuda.synchronize()
+    tr["t_sync_s"] = round(time.time() - t0, 3)
 
     # t_prefetch: checkpoint CPU 로드 + 대기
     torch.cuda.synchronize()
@@ -648,12 +661,13 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     tr["surgery_ok"] = surgery_ok
 
     tr["t_total_transition_s"] = round(
-        tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_surgery_s"], 3
+        tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_surgery_s"], 3
     )
     tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
 
     status = "✅ surgery" if surgery_ok else "⚠️ fallback(full prefill)"
-    print(f"    → t_prefetch={tr['t_prefetch_s']:.3f}s | "
+    print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
+          f"t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
           f"t_surgery={tr['t_surgery_s']:.3f}s ({status}) | "
           f"t_transition={tr['t_total_transition_s']:.3f}s")
@@ -983,7 +997,7 @@ def compare(path_a: str, path_b: str):
         # sync (partial only)
         va = ta.get("t_sync_s", 0.0)
         vb = tb.get("t_sync_s", 0.0)
-        print(fmt_row("  t_sync [GPU→CPU buffer, partial only]", va, vb))
+        print(fmt_row("  t_sync [GPU persistent buffer→cache, partial only]", va, vb))
 
         print(fmt_row("  t_prefetch [ckpt CPU load]",
                       ta.get("t_prefetch_s"), tb.get("t_prefetch_s")))

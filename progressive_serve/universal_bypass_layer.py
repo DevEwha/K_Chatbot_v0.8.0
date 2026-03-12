@@ -1,11 +1,9 @@
 """
-Universal Bypass Layer - Simple Wrapper (CUDA Graph Safe)
-progressive_serve/universal_bypass_layer.py
+Universal Bypass Layer - base layer를 alpha 값과 함께 감싸는 wrapper.
 
-✅ 단순 wrapper (alpha 관리만)
-✅ Forward는 base layer 그대로 호출
-✅ Two-path blending은 모델 forward에서 처리
-✅ CUDA Graph compatible: No .item() calls in forward!
+forward는 base layer를 그대로 호출하고, two-path blending
+(alpha * Path_A + (1-alpha) * Path_B)은 모델의 forward 루프에서 처리.
+CUDA Graph 호환: forward에서 .item() 호출 없음, alpha는 in-place fill_()로만 업데이트.
 """
 
 import torch
@@ -92,29 +90,13 @@ class UniversalBypassLayer(nn.Module):
         return self._is_active
     
     def get_alpha(self) -> torch.Tensor:
-        """
-        현재 alpha 값 (tensor 반환)
-        
-        CUDA Graph Compatibility:
-        - Returns tensor, not float!
-        - No .item() call during forward pass
-        - Use this in forward loops
-        
-        Returns:
-            torch.Tensor: Alpha value as 0-d tensor (scalar)
-        """
+        """alpha 값을 tensor로 반환. forward 루프에서 사용 (CUDA Graph safe)."""
         return self.alpha
-    
+
     def get_alpha_value(self) -> float:
         """
-        현재 alpha 값 (float 반환)
-        
-        WARNING: Only use outside of CUDA Graph capture!
-        - For logging, debugging, status printing
-        - NOT for forward pass computations
-        
-        Returns:
-            float: Alpha value as Python float
+        alpha 값을 float으로 반환.
+        WARNING: CUDA Graph 캡처 중 사용 금지. 로깅/상태 출력에만 사용.
         """
         return self.alpha.item()
     

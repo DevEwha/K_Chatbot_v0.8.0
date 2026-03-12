@@ -1,9 +1,10 @@
 """
-vLLM v1(0.15.1)을 위한 코드 
-* 모든 Decoder-only 모델 지원(Llama, Mistral, QWen, Phi, Gemma, GPT-2, Falcon등)
-레이어 항상 실행해 topology 불변
-Path A(레이어 통과)+Path B(직접 연결) 둘 다 계산
-Alpha로 어느 경로를 다음 레이어로 전달할지 선택
+Progressive Model Dual-Path (vLLM v0.8.0, v0 engine)
+
+모든 Decoder-only 모델 지원 (LLaMA, Mistral, Qwen, Phi, Gemma, GPT-2, Falcon 등)
+- 레이어는 항상 실행 (CUDA Graph topology 불변)
+- Path A (레이어 통과) + Path B (직접 연결) 둘 다 계산
+- Alpha로 어느 경로를 다음 레이어로 전달할지 선택
 """
 
 
@@ -184,8 +185,7 @@ class ProgressiveModelDualPath(nn.Module):
             if layer_idx in self.initially_inactive:
                 print(f"[Init] Layer {layer_idx:2d}: DualPath (alpha=0, Path B)")
                 
-                # Weight를 0으로 초기화
-                # alpha=0일 때 Path A는 zero-output이므로 GPU 최적화됨
+                # 아직 로드되지 않은 레이어 가중치를 0으로 초기화
                 self._initialize_weights_to_zero(base_layer)
                 
                 wrapped = UniversalBypassLayer(
@@ -326,13 +326,11 @@ class ProgressiveModelDualPath(nn.Module):
     # ----------------------------------------------------------------
     def sync_persistent_cache(self, seq_len: int):
         """
-        GPU persistent buffer의 현재 상태를 스냅샷하여 _layer_output_cache에 저장.
-        
-        [최적화 내용]
-        - 기존의 .cpu() 호출을 제거하여 악명 높은 PCIe 대역폭 병목(D2H)을 없앴습니다.
-        - 대신 GPU 내에서 .clone()을 사용하여 빠르게 복사합니다.
-        - clone()을 사용하는 이유는 partial recompute 도중 버퍼에 in-place 기록이 
-          발생하여 참조가 꼬이는 것을 방지하기 위함입니다 (VRAM to VRAM 복사는 1ms 이하로 매우 빠름).
+        GPU persistent buffer의 현재 상태를 _layer_output_cache에 스냅샷.
+
+        Stage 전환 직전에 호출. GPU 내에서 clone()으로 복사 (D2H 전송 없음).
+        clone()은 partial recompute 도중 버퍼에 in-place 기록이 발생하여
+        참조가 꼬이는 것을 방지하기 위함.
         """
         if not self._persistent_buffers_initialized:
             print(f"[Cache] ⚠️ Persistent buffers not initialized")
@@ -341,34 +339,12 @@ class ProgressiveModelDualPath(nn.Module):
         max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
 
         self._layer_output_cache.clear()
-        
-        # GPU 내에서 바로 슬라이싱 및 복제 수행
         for layer_idx in range(max_layer + 1):
             h = self._persistent_h_buffers[layer_idx][:seq_len].clone()
             r = self._persistent_r_buffers[layer_idx][:seq_len].clone()
             self._layer_output_cache[layer_idx] = {"output": (h, r)}
 
-        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU-only, No CPU transfer)")
-    # def sync_persistent_cache(self, seq_len: int):
-    #     """
-    #     GPU persistent buffer → CPU _layer_output_cache
-
-    #     Stage 전환 직전에 chatbot에서 호출.
-    #     GPU buffer의 [0:seq_len] 구간을 CPU로 복사하여 partial recompute에 사용.
-    #     """
-    #     if not self._persistent_buffers_initialized:
-    #         print(f"[Cache] ⚠️ Persistent buffers not initialized")
-    #         return
-
-    #     max_layer = self._max_cacheable_layer if self._max_cacheable_layer is not None else len(self.layers) - 1
-
-    #     self._layer_output_cache.clear()
-    #     for layer_idx in range(max_layer + 1):
-    #         h = self._persistent_h_buffers[layer_idx][:seq_len].cpu()
-    #         r = self._persistent_r_buffers[layer_idx][:seq_len].cpu()
-    #         self._layer_output_cache[layer_idx] = {"output": (h, r)}
-
-    #     print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → CPU)")
+        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU-only)")
 
     def clear_persistent_buffers(self):
         """Persistent buffer 초기화 (warmup 데이터 제거)"""
@@ -409,13 +385,10 @@ class ProgressiveModelDualPath(nn.Module):
         - All operations on GPU tensors
         """
 
-        # ── KV Surgery: block_tables 추적 ──
-        # CUDA graph 호환: clone() 대신 view 저장
-        #   - CUDA graph 캡처 시: Python forward() 실행 → view 저장
-        #   - CUDA graph replay 시: prepare_graph_input_buffers()가 원본 텐서 in-place 업데이트
-        #     → view가 자동으로 최신 값 반영 (라이브 포인터)
-        #   - Eager 모드 시: 매 step마다 forward() 실행 → view 갱신
-        # 주의: clone() 사용 시 CUDA graph 캡처 시점의 dummy 값이 고정됨 → 버그!
+        # KV Surgery: decode step마다 block_tables를 view로 저장.
+        # view를 사용하는 이유: CUDA graph replay 시 prepare_graph_input_buffers()가
+        # 원본 텐서를 in-place 업데이트하면 view도 자동으로 최신 값을 반영.
+        # clone()을 사용하면 graph 캡처 시점의 dummy 값이 고정되어 버그 발생.
         try:
             from vllm.forward_context import get_forward_context as _get_fwd_ctx
             _fwd_meta = _get_fwd_ctx().attn_metadata
@@ -425,8 +398,6 @@ class ProgressiveModelDualPath(nn.Module):
                     and _fwd_meta.block_tables.numel() > 0
                     and getattr(_fwd_meta, 'seq_lens_tensor', None) is not None
                     and _fwd_meta.seq_lens_tensor.numel() > 0):
-                # view (not clone): 원본 텐서와 동일한 메모리 공유
-                # → CUDA graph replay 전 prepare_graph_input_buffers()가 원본 업데이트 시 자동 반영
                 self._surgery_block_tables = _fwd_meta.block_tables[:1]
                 self._surgery_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
         except Exception:
@@ -448,7 +419,6 @@ class ProgressiveModelDualPath(nn.Module):
             and self._is_cache_compatible(hidden_states)
         )
 
-        # 디버그: Partial recompute 시작
         if use_partial:
             print(f"\n[PartialRecompute] 🚀 Starting partial KV recomputation")
             print(f"  Boundary: {boundary}")
@@ -489,7 +459,6 @@ class ProgressiveModelDualPath(nn.Module):
                     hidden_states = cached["output"][0].to(hidden_states.device)
                     residual = cached["output"][1].to(hidden_states.device) if cached["output"][1] is not None else None
 
-                    # 디버그: KV-only 카운트
                     if layer_idx == 0 or layer_idx % 5 == 0 or layer_idx == boundary - 1:
                         print(f"  Layer {layer_idx:2d}: ✓ KV-only (cached)")
                     kv_only_count += 1
@@ -532,13 +501,11 @@ class ProgressiveModelDualPath(nn.Module):
                 if residual is not None:
                     self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
 
-            # 디버그: Full forward 카운트
             if use_partial and layer_idx >= boundary:
                 if layer_idx == boundary or layer_idx % 5 == 0 or layer_idx == len(self.layers) - 1:
                     print(f"  Layer {layer_idx:2d}: ↻ Full forward (recompute)")
                 full_forward_count += 1
 
-        # 디버그: Partial recompute 완료 통계
         if use_partial:
             print(f"\n[PartialRecompute] ✅ Completed")
             print(f"  KV-only:      {kv_only_count} layers (skipped attention+MLP)")

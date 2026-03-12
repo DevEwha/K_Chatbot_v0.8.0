@@ -1,20 +1,9 @@
 """
-Universal ProgressiveForCausalLM with Dual-Path Design
-vLLM v0.8.0 Compatible (v0 engine) - Supports All Decoder-Only Models
+Progressive ForCausalLM (vLLM v0.8.0, v0 engine)
 
-✅ 모든 Decoder-only 모델 지원
-✅ Path A/B 둘 다 항상 계산 (CUDA Graph topology 불변)
-✅ Alpha로 경로 선택
-✅ prune_log.json 기반 자동 레이어 결정
-✅ v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
-
-<핵심 기능>
-_load_prune_log: 모델 폴더의 prune_log.json을 읽어서 "이번엔 몇 번 레이어를 끄고 시작할까?"를 결정
-
-load_weights: model_config.py의 정보를 이용해 체크포인트 파일에서 가중치를 읽어와 모델에 집어넣음.
-만약 꺼진 레이어(Inactive)라면 가중치를 0으로 채워 메모리를 아끼거나 초기화 이슈를 방지합니다.
-
-advance_to_stageX: 다음 단계로 넘어갈 때 필요한 추가 가중치 파일(Safetensors)을 로드하고, model.activate_layers를 호출
+모든 Decoder-only 모델 지원 (LLaMA, Mistral, Qwen2 등).
+prune_log.json 기반으로 stage별 inactive layers를 결정하고,
+ProgressiveModelDualPath를 통해 Dual-Path forward를 실행.
 """
 
 from typing import Optional, List, Iterable, Tuple, Any, Dict
@@ -43,7 +32,7 @@ from model_config import get_model_type, get_weight_pattern
 
 class ProgressiveForCausalLM(nn.Module):
     """
-    Universal ForCausalLM wrapper with Dual-Path Design (vLLM v0.8.0, v0 engine)
+    ForCausalLM wrapper for progressive serving (vLLM v0.8.0, v0 engine).
 
     지원 모델:
     - LLaMA (1, 2, 3), CodeLlama, Vicuna, Alpaca
@@ -56,11 +45,8 @@ class ProgressiveForCausalLM(nn.Module):
     - DeepSeek (v1, v2)
     - Yi
 
-    핵심:
-    - Path A/B 둘 다 항상 계산
-    - Alpha로 경로 선택
-    - 완벽한 CUDA Graph safety
-    - v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
+    Stage 전환:
+    prefetch_stage2/3() → wait_for_prefetch() → advance_to_stage2/3_instant()
     """
     supports_multimodal = False
     supports_pooling = False 

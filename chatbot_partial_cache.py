@@ -43,13 +43,10 @@ from vllm.model_executor.models.registry import ModelRegistry
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "progressive_serve"))
 from progressive_for_causal_lm import ProgressiveForCausalLM
 
-# =========================================================
-# 🔥 vLLM v0.8.0 버그 우회 (Prefix Caching 강제 활성화 패치)
-# =========================================================
+# vLLM v0.8.0 workaround: custom 모델을 멀티모달로 잘못 판단하여
+# prefix caching이 비활성화되는 버그를 우회.
 import vllm.config
-# vLLM이 이 모델을 멀티모달로 착각하지 않도록 속임
 vllm.config.ModelConfig.is_multimodal_model = property(lambda self: False)
-# =========================================================
 
 # ============================================================================
 # 모델 설정

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Progressive Serving Chatbot - Partial KV Cache Recomputation
-=============================================================
+Progressive Serving Chatbot - True KV Block Surgery
+=====================================================
 
 Interactive chatbot with progressive model serving (vLLM v0 engine).
 Stage transitions on user command (/stage2, /stage3).
 
-**핵심 차이점 (vs chatbot_full_cache.py):**
-- KV Cache를 턴 사이에 유지 (재초기화 안 함)
-- Stage 전환 시에만 부분적 KV Cache 재계산:
-  * Boundary 이전 레이어: 완전 스킵 (가중치 불변 → KV cache 그대로 유효)
-  * Boundary 이후 레이어: full forward (새로운 가중치로 재계산)
-- Hidden states CPU 캐싱으로 GPU 연산 최소화
-- CUDA Graph 재캡처 최소화 (prefill에서만 partial recompute)
+**핵심 동작 (True KV Block Surgery):**
+- KV Cache를 턴 사이에 유지 (prefix caching)
+- Stage 전환 시:
+  * Lower layers (boundary 이전): KV cache 전혀 손대지 않음 (가중치 동일 → KV 동일)
+  * Upper layers (boundary 이후): 동일 physical block에 새 가중치로 KV 덮어쓰기
+  * vLLM prefix cache hash→block 매핑 유지 → 다음 generate()에서 prefill 완전 스킵!
+- Fallback: surgery 실패 시 reset_prefix_cache + partial recompute
 
 Usage:
   python chatbot_partial_cache.py --model llama
   python chatbot_partial_cache.py --model mistral
 
   Commands during chat:
-    /stage2  - Transition to Stage 2 (partial KV recomputation)
-    /stage3  - Transition to Stage 3 (partial KV recomputation)
+    /stage2  - Transition to Stage 2 (KV block surgery)
+    /stage3  - Transition to Stage 3 (KV block surgery)
     /status  - Show model status
     /reset   - Reset conversation
     /quit    - Exit
@@ -52,7 +52,7 @@ vllm.config.ModelConfig.is_multimodal_model = property(lambda self: False)
 # =========================================================
 
 # ============================================================================
-# 모델 설정 (02_universal.py 동일)
+# 모델 설정
 # ============================================================================
 
 MODELS = {
@@ -70,19 +70,20 @@ MODELS = {
 
 
 # ============================================================================
-# Chatbot with Partial KV Cache Recomputation
+# Chatbot with True KV Block Surgery
 # ============================================================================
 
 class ProgressiveChatbotPartial:
     """
-    Progressive Serving 기반 대화형 챗봇 (Partial KV Cache Recomputation)
+    Progressive Serving 기반 대화형 챗봇 (True KV Block Surgery)
 
     핵심 기능:
-    - KV Cache 턴 간 유지 (vLLM KV 블록 재사용)
-    - Stage 전환 시 부분 재계산:
-      * Unchanged layers (< boundary): 완전 스킵 (GPU 연산 없음, KV cache 유효)
-      * Changed layers (>= boundary): full forward (새 가중치로 KV 재계산)
-    - Hidden states CPU 캐싱으로 GPU 연산 최소화
+    - KV Cache 턴 간 유지 (vLLM prefix caching)
+    - Stage 전환 시 KV block surgery:
+      * Lower layers: KV 완전 보존 (연산 없음)
+      * Upper layers: 동일 physical block에 새 KV 덮어쓰기
+      * 다음 generate()에서 prefill 스킵 → 진짜 zero-overhead transition
+    - Surgery 실패 시 fallback: reset + partial recompute
     """
 
     def __init__(self, model_name: str):
@@ -105,19 +106,14 @@ class ProgressiveChatbotPartial:
             trust_remote_code=True,
             gpu_memory_utilization=0.4,
             max_model_len=2048,
-            # 🔥 enforce_eager=False: CUDA graph 활성화
-            # Persistent GPU buffer + index_copy_()가 CUDA graph에 캡처되어
-            # decode phase에서도 hidden states가 자동 누적됨
-            enforce_eager=False,
-            # Prefix caching 활성화 (KV cache 턴 간 유지)
-            enable_prefix_caching=True,
+            enforce_eager=False,         # CUDA graph 활성화
+            enable_prefix_caching=True,  # KV cache 턴 간 유지
         )
 
-        # v0 엔진 모델 핸들 (02_universal.py 동일)
+        # v0 엔진 모델 핸들
         self.model = self._get_model_handle()
 
-        # 🔥 Persistent GPU buffer: warmup 중 기록된 쓰레기값 제거
-        # CUDA graph 캡처 후 buffer는 이미 할당되어 있음 → zero_()로 초기화만
+        # Warmup 데이터 제거
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'clear_persistent_buffers'):
             self.model.model.clear_persistent_buffers()
             print(f"  ✅ Persistent GPU buffers cleared (warmup data removed)")
@@ -132,11 +128,11 @@ class ProgressiveChatbotPartial:
             max_tokens=512,
         )
 
-        print(f"  ✅ Partial KV Cache Recomputation enabled")
+        print(f"  ✅ True KV Block Surgery enabled")
         print(f"  ✅ Prefix caching enabled (KV cache persists between turns)")
 
     def _get_model_handle(self):
-        """v0 엔진에서 progressive model 객체 가져오기 (02_universal.py 동일)"""
+        """v0 엔진에서 progressive model 객체 가져오기"""
         engine = self.llm.llm_engine
         if hasattr(engine, "engine_core"):
             raise RuntimeError(
@@ -154,20 +150,18 @@ class ProgressiveChatbotPartial:
     # 프롬프트 빌드
     # ----------------------------------------------------------------
     def _build_prompt(self) -> str:
-        """대화 기록 → 전체 프롬프트 생성 (chat template 사용)"""
-        # chat_template 사용 가능하면 사용
+        """대화 기록 → 전체 프롬프트 생성"""
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
-                prompt = self.tokenizer.apply_chat_template(
+                return self.tokenizer.apply_chat_template(
                     self.conversation,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                return prompt
             except Exception:
                 pass
 
-        # Fallback: 단순 포맷
+        # Fallback
         prompt = ""
         for msg in self.conversation:
             if msg["role"] == "user":
@@ -177,6 +171,18 @@ class ProgressiveChatbotPartial:
         prompt += "Assistant: "
         return prompt
 
+    def _get_current_seq_len(self) -> int:
+        """현재 시퀀스 길이 반환 (vLLM 내부 저장값 우선)"""
+        inner = self.model.model
+        if (inner._surgery_seq_lens_tensor is not None
+                and inner._surgery_seq_lens_tensor.numel() > 0):
+            return int(inner._surgery_seq_lens_tensor[0].item())
+        # Fallback: tokenizer로 직접 계산
+        if self.conversation:
+            prompt = self._build_prompt()
+            return len(self.tokenizer.encode(prompt))
+        return 0
+
     # ----------------------------------------------------------------
     # 채팅
     # ----------------------------------------------------------------
@@ -184,8 +190,7 @@ class ProgressiveChatbotPartial:
         """
         사용자 입력 → 응답 생성.
 
-        Prefix caching 활성화로 이전 대화의 KV cache가 재사용됩니다.
-        Stage 전환 직후 첫 턴에는 partial KV recomputation이 자동 실행됩니다.
+        Prefix caching으로 이전 대화의 KV cache가 재사용됩니다.
         """
         self.conversation.append({"role": "user", "content": user_input})
 
@@ -193,7 +198,7 @@ class ProgressiveChatbotPartial:
 
         # 프롬프트 길이 경고
         token_ids = self.tokenizer.encode(prompt)
-        if len(token_ids) > 1800:  # max_model_len=2048, 여유 확보
+        if len(token_ids) > 1800:
             print(f"  [Warning] Conversation length ({len(token_ids)} tokens) "
                   f"approaching limit. Consider /reset.")
 
@@ -204,17 +209,19 @@ class ProgressiveChatbotPartial:
         return response
 
     # ----------------------------------------------------------------
-    # Stage 전환 (Partial KV Recomputation)
+    # Stage 전환 (True KV Block Surgery)
     # ----------------------------------------------------------------
     def advance_to_stage2(self) -> bool:
         """
-        Stage 1 → Stage 2 전환 (prefetch → instant transition)
+        Stage 1 → Stage 2 전환
 
-        Partial KV Recomputation:
-        - Stage 전환 즉시 boundary layer 설정
-        - 현재 대화를 즉시 재계산하여 partial recompute 실행
-        - Boundary 이전: KV-only (빠름, 캐시된 hidden states 사용)
-        - Boundary 이후: full forward (정확, 새 가중치 반영)
+        1. 가중치 prefetch (백그라운드)
+        2. 가중치 instant activation (GPU copy)
+        3. KV Block Surgery:
+           - Lower layers: KV 그대로 (연산 없음)
+           - Upper layers: 동일 block에 새 KV 덮어쓰기
+           - prefix cache 유지 → 다음 generate() prefill 스킵
+        4. Surgery 실패 시: reset_prefix_cache + partial recompute fallback
         """
         if self.current_stage >= 2:
             print("  Already at Stage 2 or higher.")
@@ -225,8 +232,18 @@ class ProgressiveChatbotPartial:
             print(f"  Stage B checkpoint not found: {stage_b_path}")
             return False
 
-        # 🔥 Stage 전환 전: GPU persistent buffer → CPU cache 동기화
-        self._sync_cache_before_transition()
+        inner_model = self.model.model  # ProgressiveModelDualPath
+        b_indices = self.model._get_b_indices()
+        boundary = self.model.get_recompute_boundary(b_indices)
+        has_conversation = len(self.conversation) > 0
+
+        # Surgery fallback을 위해 hidden state 캐시 미리 준비
+        # (surgery 실패 시 partial recompute에서 사용)
+        if has_conversation and boundary is not None:
+            seq_len = self._get_current_seq_len()
+            if seq_len > 0 and hasattr(inner_model, 'sync_persistent_cache'):
+                print(f"  [Prep] Caching {seq_len} tokens (fallback용)")
+                inner_model.sync_persistent_cache(seq_len)
 
         print("  [Stage 1 -> 2] Prefetching...")
         t0 = time.time()
@@ -237,7 +254,7 @@ class ProgressiveChatbotPartial:
             print("  Stage 2 prefetch failed or timed out.")
             return False
 
-        # Instant transition (partial recompute boundary 자동 설정됨)
+        # Instant transition (GPU weight copy + alpha 변경)
         transitioned = self.model.advance_to_stage2_instant(wait_if_needed=False)
         if not transitioned:
             print("  Stage 2 instant transition failed.")
@@ -247,29 +264,33 @@ class ProgressiveChatbotPartial:
         elapsed = time.time() - t0
 
         stage_info = self.model.get_stage_info()
-        print(f"  ✅ Stage 2 transition complete ({elapsed:.2f}s)")
+        print(f"  ✅ Stage 2 weight activation complete ({elapsed:.2f}s)")
         print(f"  Active layers: {len(stage_info['active_layers'])}, "
               f"Progress: {stage_info['activation_progress']}")
-        
-        # =========================================================
-        # 🔥 추가할 부분: vLLM이 프롬프트를 자르지 못하게 캐시 강제 초기화
-        # =========================================================
-        if hasattr(self.llm, "reset_prefix_cache"):
-            self.llm.reset_prefix_cache()
 
-        # 🔥 CRITICAL: Trigger partial recompute NOW with current conversation
-        # This ensures cached hidden states match the current prompt length
-        self._trigger_partial_recompute()
+        # ── KV Block Surgery ──
+        if has_conversation and boundary is not None:
+            surgery_ok = inner_model.inject_upper_layer_kv(boundary)
+
+            if not surgery_ok:
+                # Fallback: reset prefix cache + partial recompute
+                print("  [Stage2] ⚠️ Surgery 실패, partial recompute fallback 실행")
+                inner_model.set_partial_recompute(boundary)
+                self.llm.reset_prefix_cache()
+                self._trigger_partial_recompute()
+            # else: surgery 성공 → prefix cache 유지 → 다음 generate()에서 prefill 스킵
+
+        elif not has_conversation:
+            # 대화 없음: prefix cache만 초기화 (upper layer KV = zeros였음)
+            self.llm.reset_prefix_cache()
 
         return True
 
     def advance_to_stage3(self) -> bool:
         """
-        Stage 2 → Stage 3 전환 (prefetch → instant transition)
+        Stage 2 → Stage 3 전환
 
-        Partial KV Recomputation:
-        - Stage 전환 즉시 boundary layer 설정
-        - 현재 대화를 즉시 재계산하여 partial recompute 실행
+        동일 KV Block Surgery 방식 적용.
         """
         if self.current_stage < 2:
             print("  Must be at Stage 2 first. Use /stage2.")
@@ -283,8 +304,17 @@ class ProgressiveChatbotPartial:
             print(f"  Stage C checkpoint not found: {stage_c_path}")
             return False
 
-        # 🔥 Stage 전환 전: GPU persistent buffer → CPU cache 동기화
-        self._sync_cache_before_transition()
+        inner_model = self.model.model
+        c_indices = self.model._get_c_indices()
+        boundary = self.model.get_recompute_boundary(c_indices)
+        has_conversation = len(self.conversation) > 0
+
+        # Surgery fallback용 hidden state 캐시 준비
+        if has_conversation and boundary is not None:
+            seq_len = self._get_current_seq_len()
+            if seq_len > 0 and hasattr(inner_model, 'sync_persistent_cache'):
+                print(f"  [Prep] Caching {seq_len} tokens (fallback용)")
+                inner_model.sync_persistent_cache(seq_len)
 
         print("  [Stage 2 -> 3] Prefetching...")
         t0 = time.time()
@@ -295,7 +325,6 @@ class ProgressiveChatbotPartial:
             print("  Stage 3 prefetch failed or timed out.")
             return False
 
-        # Instant transition (partial recompute boundary 자동 설정됨)
         transitioned = self.model.advance_to_stage3_instant(wait_if_needed=False)
         if not transitioned:
             print("  Stage 3 instant transition failed.")
@@ -305,131 +334,90 @@ class ProgressiveChatbotPartial:
         elapsed = time.time() - t0
 
         stage_info = self.model.get_stage_info()
-        print(f"  ✅ Stage 3 transition complete ({elapsed:.2f}s)")
+        print(f"  ✅ Stage 3 weight activation complete ({elapsed:.2f}s)")
         print(f"  Active layers: {len(stage_info['active_layers'])}, "
               f"Progress: {stage_info['activation_progress']}")
 
-        # =========================================================
-        # 🔥 추가할 부분: vLLM이 프롬프트를 자르지 못하게 캐시 강제 초기화
-        # =========================================================
-        if hasattr(self.llm, "reset_prefix_cache"):
-            self.llm.reset_prefix_cache()
+        # ── KV Block Surgery ──
+        if has_conversation and boundary is not None:
+            surgery_ok = inner_model.inject_upper_layer_kv(boundary)
 
-        # 🔥 CRITICAL: Trigger partial recompute NOW with current conversation
-        self._trigger_partial_recompute()
+            if not surgery_ok:
+                print("  [Stage3] ⚠️ Surgery 실패, partial recompute fallback 실행")
+                inner_model.set_partial_recompute(boundary)
+                self.llm.reset_prefix_cache()
+                self._trigger_partial_recompute()
+
+        elif not has_conversation:
+            self.llm.reset_prefix_cache()
 
         return True
 
     # ----------------------------------------------------------------
-    # Persistent Buffer → CPU Cache 동기화
-    # ----------------------------------------------------------------
-    def _sync_cache_before_transition(self):
-        """
-        Stage 전환 직전: GPU persistent buffer에 누적된 hidden states를 CPU로 동기화.
-
-        - Persistent buffer에는 prefill + decode의 hidden states가 index_copy_()로 누적
-        - 현재 대화의 전체 토큰 수를 계산하여 해당 범위만 CPU로 복사
-        - 이후 partial recompute에서 CPU cache를 사용
-        """
-        if not hasattr(self.model, 'model'):
-            return
-
-        inner_model = self.model.model
-        if not hasattr(inner_model, 'sync_persistent_cache'):
-            return
-
-        # 현재 대화의 토큰 수 계산
-        prompt = self._build_prompt()
-        token_ids = self.tokenizer.encode(prompt)
-        seq_len = len(token_ids)
-
-        print(f"  [Sync] GPU buffer → CPU cache ({seq_len} tokens)")
-        inner_model.sync_persistent_cache(seq_len)
-
-    # ----------------------------------------------------------------
-    # Partial Recompute 트리거
+    # Partial Recompute (fallback)
     # ----------------------------------------------------------------
     def _trigger_partial_recompute(self):
         """
-        Stage 전환 직후 현재 대화를 재계산하여 partial KV recompute 실행.
+        Surgery 실패 시 fallback: 현재 대화로 partial KV recompute 실행.
 
-        sync_persistent_cache() 기반 방식 (benchmark_chatbots.py 동일):
-        - _sync_cache_before_transition()에서 이미 GPU hidden states →
-          _layer_output_cache 저장 완료
-        - reset_prefix_cache()로 stale KV blocks 제거
-        - generate()로 partial recompute 트리거:
-          * Boundary 이전 레이어: _layer_output_cache의 hidden states 재사용
-          * Boundary 이후 레이어: full forward (새 가중치로 KV 재계산)
-        - 완료 후 새 K,V가 prefix cache에 저장됨 → 다음 generate()에서 prefill 스킵
+        reset_prefix_cache() 이후에 호출 (새 블록 할당 필요).
         """
         if len(self.conversation) == 0:
             print(f"  [PartialRecompute] No conversation history, skipping")
             return
 
-        print(f"\n  [PartialRecompute] Triggering with current conversation...")
-        print(f"  Conversation turns: {len(self.conversation) // 2}")
-
-        # boundary 확인 (advance_to_stage*_instant에서 이미 설정됨)
-        inner_model = self.model.model  # ProgressiveModelDualPath
+        inner_model = self.model.model
         boundary = inner_model._partial_recompute_boundary
         if boundary is None:
             print(f"  [PartialRecompute] No boundary set, skipping")
             return
 
-        # 현재 대화로 프롬프트 생성
+        print(f"\n  [PartialRecompute] Running fallback partial recompute...")
+
         prompt = self._build_prompt()
         token_ids = self.tokenizer.encode(prompt)
         print(f"  Prompt tokens: {len(token_ids)}, boundary layer: {boundary}")
 
-        # stale KV prefix cache blocks 제거
-        self.llm.reset_prefix_cache()
-
-        # 최소 생성으로 partial recompute 트리거 (forward pass + KV cache write)
         minimal_params = SamplingParams(temperature=0.0, max_tokens=1)
 
-        print(f"  [PartialRecompute] Running generate()...")
         t0 = time.time()
         self.llm.generate([prompt], minimal_params)
         elapsed = time.time() - t0
 
-        print(f"  ✅ Partial recomputation complete ({elapsed:.2f}s)")
-        print(f"  📌 Front layers (0~{boundary-1}): hidden states from cache (GPU-only)")
-        print(f"  📌 Back  layers ({boundary}~): full forward with new weights")
-        print(f"  📌 Prefix cache populated → next generate() will skip prefill\n")
+        print(f"  ✅ Partial recompute complete ({elapsed:.2f}s)")
+        print(f"  📌 Lower (0~{boundary-1}): KV from cache")
+        print(f"  📌 Upper ({boundary}~): full forward with new weights\n")
 
     # ----------------------------------------------------------------
     # 상태 / 리셋
     # ----------------------------------------------------------------
     def reset_conversation(self):
-        """
-        대화 기록 초기화.
-
-        Hidden state cache도 함께 클리어됩니다.
-        """
+        """대화 기록 초기화."""
         self.conversation = []
 
-        # Hidden state cache + persistent buffer 클리어
         if hasattr(self.model, 'model'):
             inner = self.model.model
             if hasattr(inner, 'clear_hidden_cache'):
                 inner.clear_hidden_cache()
             if hasattr(inner, 'clear_persistent_buffers'):
                 inner.clear_persistent_buffers()
-            print("  Conversation, hidden cache, and persistent buffers reset.")
+            # _surgery_block_tables / _surgery_seq_lens_tensor는 CUDA graph input buffer의 view임
+            # → 초기화 불필요: 다음 decode step에서 자동으로 새 대화의 값으로 업데이트됨
+            print("  Conversation and hidden caches reset.")
         else:
             print("  Conversation reset.")
 
     def print_status(self):
         """현재 상태 출력"""
         stage_info = self.model.get_stage_info()
+        inner_model = self.model.model
 
-        # Partial recompute 상태 확인
-        partial_mode = False
-        if hasattr(self.model, 'model'):
-            inner_model = self.model.model
-            if hasattr(inner_model, '_partial_recompute_boundary'):
-                boundary = inner_model._partial_recompute_boundary
-                partial_mode = boundary is not None
+        partial_mode = inner_model._partial_recompute_boundary is not None
+        # Surgery state는 CUDA graph view → has_conversation일 때만 유효
+        has_valid_surgery_state = (
+            inner_model._surgery_block_tables is not None
+            and len(self.conversation) > 0
+        )
 
         print(f"\n  {'='*50}")
         print(f"  Model:    {self.model_name}")
@@ -439,7 +427,9 @@ class ProgressiveChatbotPartial:
         print(f"  Progress: {stage_info['activation_progress']}")
         print(f"  Turns:    {len(self.conversation) // 2}")
         print(f"  GPU Mem:  {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
-        print(f"  Partial Recompute: {'Active' if partial_mode else 'Idle'}")
+        print(f"  Surgery Ready: {'Yes' if has_valid_surgery_state else 'No (no conversation yet)'}")
+        if partial_mode:
+            print(f"  Partial Recompute: Active (boundary={inner_model._partial_recompute_boundary})")
         print(f"  {'='*50}")
 
 
@@ -449,7 +439,7 @@ class ProgressiveChatbotPartial:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Progressive Serving Chatbot (Partial KV Cache Recomputation)"
+        description="Progressive Serving Chatbot (True KV Block Surgery)"
     )
     parser.add_argument(
         "--model",
@@ -461,7 +451,7 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "=" * 60)
-    print("Progressive Serving Chatbot - Partial KV Recomputation")
+    print("Progressive Serving Chatbot - True KV Block Surgery")
     print(f"  Model: {args.model}")
     print(f"  GPU:   {torch.cuda.get_device_name(0)}")
     print("=" * 60)
@@ -471,8 +461,8 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Ready! (Stage {chatbot.current_stage})")
     print(f"  Commands: /stage2, /stage3, /status, /reset, /quit")
-    print(f"  🚀 KV Cache persists between turns (prefix caching)")
-    print(f"  🚀 Partial recomputation on stage transitions")
+    print(f"  🔪 KV Block Surgery: upper layers overwritten in-place")
+    print(f"  🚀 Prefix cache preserved → next generate() skips prefill")
     print(f"{'='*60}\n")
 
     while True:

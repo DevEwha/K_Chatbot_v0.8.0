@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-Benchmark: chatbot_origin vs chatbot_partial_cache
+Benchmark: chatbot_origin vs chatbot_partial_cache (일반 프롬프트 버전)
 =====================================================
+
+benchmark_chatbots.py 와 동일한 구조지만, 일반적인 길이의 프롬프트를 사용.
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 없이 max_model_len=4096 으로 실행 가능.
 
 각 모드를 **별도 프로세스**로 실행하여 공정한 비교.
 (동일 프로세스에서 두 모드를 순차 실행하면 GPU/OS page cache가 공유되어 불공정)
 
 Usage:
   # 1) Origin 모드 실행 (별도 터미널 / GPU 0)
-  python benchmark_chatbots.py --mode origin --model llama --output results_origin.json
+  python benchmark_chatbots_normal.py --mode origin --model llama --output results_origin.json
 
   # 2) Partial 모드 실행 (별도 터미널 / GPU 0, origin 완전 종료 후)
-  python benchmark_chatbots.py --mode partial --model llama --output results_partial.json
+  python benchmark_chatbots_normal.py --mode partial --model llama --output results_partial.json
 
   # 3) 결과 비교
-  python benchmark_chatbots.py --compare results_origin.json results_partial.json
+  python benchmark_chatbots_normal.py --compare results_origin.json results_partial.json
+
+프롬프트 토큰 설계 (max_model_len=4096):
+  Stage 1: 6턴, 각 ~80 토큰 → 전환 시점 ~600 토큰 누적
+  Stage 2: 3턴, 각 ~80 토큰 → 전환 시점 ~900 토큰 누적
+  Stage 3: 3턴, 각 ~80 토큰 → ~1200 토큰 누적 (4096 이내)
 
 측정 항목:
   [Origin]  t_prefetch | t_activation | t_cache_clear
@@ -76,337 +84,78 @@ MODELS = {
 # 고정 대화 스크립트 (두 모드에 동일하게 적용)
 # ============================================================================
 
-# Stage 1에서 6번 대화 (KV cache 누적 — 전환 시점에 ~4200 토큰이 쌓이도록 초장문 프롬프트 사용)
-# 각 프롬프트 ~500 단어(≈650 토큰), 6턴 합계 ≈ 3900 토큰 + chat template ≈ 4200 토큰
+# Stage 1에서 6번 대화 (KV cache 누적)
+# 각 프롬프트 ~60 단어(≈80 토큰), 6턴 + chat template ≈ 600 토큰
 STAGE1_PROMPTS = [
     (
-        "Please provide an extremely comprehensive and detailed historical account of computing, "
-        "beginning with the mechanical calculators and computational devices developed in the "
-        "seventeenth century by pioneers such as Blaise Pascal, who built the Pascaline in 1642, "
-        "and Gottfried Wilhelm Leibniz, who designed the Stepped Reckoner and articulated the "
-        "binary number system that underlies all modern digital computation. Progress through the "
-        "nineteenth century with Charles Babbage's visionary but ultimately unbuilt Difference "
-        "Engine and Analytical Engine, explaining why the Analytical Engine was so far ahead of "
-        "its time, and why Ada Lovelace's notes on that machine earned her the title of the "
-        "world's first programmer. Describe in detail how the twentieth century opened an "
-        "extraordinary era of computing development, starting with the electromechanical "
-        "relay-based computers of the late 1930s such as Konrad Zuse's Z3 in Germany, through "
-        "the wartime computing efforts in Britain that produced Colossus at Bletchley Park under "
-        "the direction of Tommy Flowers, and the American ENIAC project at the University of "
-        "Pennsylvania under Eckert and Mauchly. Explain the deep theoretical foundations that "
-        "Alan Turing established in his landmark 1936 paper on computable numbers and the concept "
-        "of the Universal Turing Machine, and articulate how John von Neumann's 1945 draft report "
-        "on the EDVAC introduced the stored-program architecture that remains the fundamental "
-        "design blueprint of virtually every computer built since. Trace with technical care the "
-        "invention of the transistor at Bell Laboratories in 1947 by William Shockley, John "
-        "Bardeen, and Walter Brattain, and explain how this device displaced the fragile, "
-        "power-hungry, unreliable vacuum tube to open an entirely new era of compact and dependable "
-        "computing hardware. Continue with the invention of the integrated circuit independently "
-        "by Jack Kilby at Texas Instruments in 1958 and Robert Noyce at Fairchild Semiconductor "
-        "in 1959, and trace the development of the microprocessor step by step, beginning with "
-        "Intel's 4004 in 1971, moving to the 8080 in 1974, and the 8086 in 1978, which "
-        "established the x86 architecture that still dominates personal and server computing "
-        "today. Describe the minicomputer era of the 1960s and 1970s, including the influential "
-        "PDP series from Digital Equipment Corporation, which made computing accessible to "
-        "universities and research laboratories that could not afford mainframes, and explain "
-        "how this democratization laid the social and intellectual groundwork for what followed. "
-        "Discuss the birth of the personal computer revolution with the Altair 8800 in 1975, "
-        "the Apple II in 1977, the IBM PC in 1981, and the Macintosh in 1984, and explain how "
-        "the graphical user interface concepts pioneered at Xerox PARC in the 1970s by researchers "
-        "including Alan Kay, Butler Lampson, and Charles Thacker became the dominant paradigm "
-        "for human-computer interaction that persists to this day. Address the contributions of "
-        "systems software pioneers including Grace Hopper, who created the first compiler and "
-        "co-designed COBOL, Dennis Ritchie and Ken Thompson, who built UNIX and the C language "
-        "at Bell Labs in the early 1970s, and Linus Torvalds, who released the Linux kernel in "
-        "1991 and initiated one of the most consequential open-source projects in history. "
-        "Conclude with a discussion of how computing expanded far beyond its original scientific "
-        "and military contexts into telecommunications, consumer electronics, automotive control "
-        "systems, medical imaging, and finally into the mobile phones and ubiquitous connected "
-        "devices that define contemporary life, and reflect on the geopolitical dimensions of "
-        "semiconductor supply chains and the strategic importance of chip manufacturing "
-        "capabilities for national and economic security in the twenty-first century."
+        "Give me a brief overview of the history of computing, "
+        "from early mechanical calculators to modern microprocessors. "
+        "Focus on the most important milestones."
     ),
     (
-        "Provide a thorough and technically detailed account of the entire evolution of "
-        "programming languages, tracing the full arc from the lowest levels of machine code "
-        "and assembly language through to the diverse and sophisticated language ecosystems "
-        "of today. Begin by explaining in concrete terms what machine code actually is — "
-        "sequences of binary-encoded instructions that a specific processor architecture "
-        "executes directly — and how assembly language introduced symbolic mnemonics to make "
-        "low-level programming slightly more tractable for human programmers. Discuss the "
-        "invention of the first true compiler by Grace Hopper in the early 1950s, which "
-        "automatically transformed higher-level mathematical notation into machine instructions, "
-        "and explain why this was considered such a radical and contested idea at the time, "
-        "with many engineers insisting that no machine could write code as efficiently as "
-        "a skilled human programmer. Describe in detail the development of FORTRAN by John "
-        "Backus and his team at IBM in 1957, designed specifically for scientific and "
-        "mathematical computing, and explain why its demonstration that compiled code could "
-        "approach hand-written assembly in efficiency was so significant for the acceptance "
-        "of high-level languages. Trace the subsequent history through COBOL designed for "
-        "business data processing, LISP invented by John McCarthy in 1958 for symbolic "
-        "computation and artificial intelligence research which introduced the concepts of "
-        "recursive functions and garbage collection, ALGOL which contributed block structure "
-        "and lexical scoping and introduced the Backus-Naur Form as a formal notation for "
-        "language syntax, and BASIC which was explicitly designed to make programming "
-        "accessible to non-specialists and students without engineering backgrounds. Explain "
-        "the structured programming movement of the 1960s and 1970s championed by Edsger "
-        "Dijkstra, who famously argued in a letter that the goto statement was harmful and "
-        "should be eliminated from programming practice, and how Pascal was designed by "
-        "Niklaus Wirth specifically to enforce structured programming discipline. Trace in "
-        "detail the creation of C by Dennis Ritchie at Bell Labs in the early 1970s, which "
-        "uniquely offered low-level memory control through pointer arithmetic alongside "
-        "high-level abstractions, becoming the lingua franca of systems programming that "
-        "it remains today. Discuss the emergence and spread of object-oriented programming "
-        "through Simula in the 1960s and Smalltalk in the 1970s at Xerox PARC, and how "
-        "these ideas were incorporated into C++ by Bjarne Stroustrup in the 1980s and then "
-        "into Java by James Gosling at Sun Microsystems in 1995, whose write-once-run-anywhere "
-        "promise via the Java Virtual Machine fundamentally reshaped enterprise software "
-        "development. Describe the scripting language revolution of the 1990s with Python, "
-        "Perl, Ruby, JavaScript, and PHP enabling rapid development for web applications and "
-        "making programming accessible to a new generation of developers. Explain the "
-        "functional programming renaissance with Haskell, OCaml, Erlang, and later Scala "
-        "and Clojure influencing mainstream languages to adopt lambdas, immutable data "
-        "structures, and pattern matching. Discuss the memory safety problem that motivated "
-        "Mozilla Research to create Rust, which achieves memory safety without garbage "
-        "collection through its ownership and borrowing type system, and conclude with "
-        "reflections on the growing role of type inference, gradual typing, and AI-assisted "
-        "code generation in reshaping how developers interact with programming languages."
+        "How did the invention of the transistor change computing? "
+        "Why was it such a significant improvement over vacuum tubes? "
+        "Mention a few key developments it enabled."
     ),
     (
-        "Describe in extensive technical depth the full evolution of computer hardware, "
-        "proceeding from the earliest vacuum tube computers through transistors, integrated "
-        "circuits, microprocessors, and modern billion-transistor chips to the specialized "
-        "AI accelerators and emerging post-silicon technologies of today. Begin with vacuum "
-        "tubes, explaining carefully how they function as electronic switches and amplifiers "
-        "through the control of electron flow in an evacuated glass envelope, why they were "
-        "used in early computers despite their obvious disadvantages, and what their fundamental "
-        "limitations were in terms of physical size, electrical power consumption, heat "
-        "generation, and catastrophic failure rates that made large-scale reliable computation "
-        "extremely difficult. Explain the decisive breakthrough represented by the invention "
-        "of the point-contact transistor at Bell Laboratories in December 1947, how it operates "
-        "through quantum mechanical effects in doped semiconductor materials, and why the "
-        "transition from vacuum tubes to solid-state transistors was so transformative, enabling "
-        "computers that were smaller, cooler, cheaper, faster, and dramatically more reliable. "
-        "Describe the invention of the planar integrated circuit and the development of "
-        "photolithographic manufacturing processes that first enabled hundreds, then thousands, "
-        "then millions, and eventually billions of transistors to be fabricated simultaneously "
-        "on a single silicon wafer through repeated cycles of deposition, exposure, and etching. "
-        "Explain Moore's Law as Gordon Moore originally formulated it in his 1965 paper, "
-        "observing that the number of transistors on a cost-effective integrated circuit had "
-        "been doubling approximately every year, and how this empirical observation became a "
-        "self-fulfilling industry roadmap that drove sustained exponential improvement for six "
-        "decades. Trace the evolution of CPU microarchitecture from simple single-issue "
-        "in-order pipelines through the introduction of instruction pipelining, out-of-order "
-        "execution, branch prediction, superscalar issue, register renaming, and aggressive "
-        "speculative execution, explaining how each technique extracts more instruction-level "
-        "parallelism from sequential programs. Discuss the memory hierarchy in technical detail: "
-        "why different levels of cache are necessary given the fundamental and growing gap "
-        "between processor speed and memory latency, how SRAM, DRAM, and NAND flash differ "
-        "in their operating principles, density, and performance characteristics, and how "
-        "cache coherence protocols maintain consistency across multiple processor cores. "
-        "Describe the GPU revolution that NVIDIA initiated, how the massively parallel "
-        "architecture of graphics processors proved ideal for general-purpose scientific and "
-        "machine learning computation through CUDA, and explain why tensor operations in "
-        "neural networks map so naturally to the matrix-multiply-and-accumulate hardware "
-        "that GPUs provide. Discuss the physical scaling limits now confronting conventional "
-        "CMOS transistors including short-channel effects, gate oxide tunneling leakage, "
-        "interconnect resistance and capacitance, and thermal dissipation constraints, and "
-        "what architectural responses the industry is pursuing: chiplet-based designs with "
-        "advanced heterogeneous integration packaging, three-dimensional stacking of memory "
-        "on logic, new transistor geometries like FinFETs and gate-all-around nanosheet "
-        "transistors, and entirely new computing substrates including quantum processors "
-        "that exploit superposition and entanglement to solve certain problem classes "
-        "exponentially faster than any conceivable classical machine."
+        "What is the von Neumann architecture and why is it still "
+        "relevant today? Briefly explain the stored-program concept "
+        "and how it differs from earlier computing designs."
     ),
     (
-        "What were the most significant innovations in operating systems from the earliest "
-        "batch-processing monitors of the 1950s through to modern cloud-native, containerized, "
-        "and serverless environments, and how has the fundamental concept of an operating "
-        "system evolved in response to the radical changes in underlying hardware and "
-        "application requirements over seven decades? Begin by explaining what the first "
-        "operating systems actually were in concrete terms: simple batch monitors running on "
-        "mainframes that accepted jobs submitted on punched cards, queued them, executed them "
-        "sequentially without any notion of interactive use or resource sharing, and printed "
-        "results on paper tape or line printers without any real-time feedback to the user. "
-        "Describe the critical development of time-sharing systems in the early 1960s at "
-        "MIT's Project MAC and the Compatible Time-Sharing System, which allowed multiple "
-        "users to interact with a single large computer simultaneously through terminals "
-        "distributed around a building, creating the illusion through rapid context switching "
-        "that each user had a personal machine. Explain the profound importance of the "
-        "creation of UNIX at Bell Laboratories by Ken Thompson and Dennis Ritchie starting "
-        "in 1969, and articulate why its guiding design principles became so influential: "
-        "programs should do one thing well, complex behavior should emerge from composition "
-        "of small tools through pipes and filters, everything in the system should be "
-        "represented as a file in a unified hierarchical namespace, and the system should be "
-        "portable across hardware by writing it in a high-level language rather than assembly. "
-        "Describe how UNIX spawned numerous derivatives including BSD at UC Berkeley, which "
-        "contributed the crucial TCP/IP networking implementation that became foundational "
-        "for the internet, and how the UNIX wars of the 1980s among competing proprietary "
-        "variants eventually gave way to standardization efforts around POSIX. Trace the "
-        "history of Microsoft's operating systems from CP/M-derived MS-DOS through Windows "
-        "3.1's cooperative multitasking, Windows 95's introduction of preemptive multitasking "
-        "and plug-and-play hardware detection for the mass market, and Windows NT which "
-        "brought a security-oriented microkernel-inspired architecture with proper memory "
-        "protection, user-mode drivers, and the Win32 API. Explain the development of "
-        "virtual memory systems in technical detail: the distinction between physical and "
-        "virtual address spaces, how multi-level page tables and hardware translation "
-        "lookaside buffers enable transparent memory virtualization, how demand paging "
-        "allows programs larger than available RAM to execute through page fault handling, "
-        "and how address space layout randomization and executable space protection improved "
-        "resistance to memory corruption attacks. Discuss modern process and thread scheduling "
-        "including the Completely Fair Scheduler in Linux, real-time scheduling policies and "
-        "their latency guarantees, and the unique challenges of fair scheduling across "
-        "heterogeneous processor cores with different performance and efficiency profiles. "
-        "Explain virtualization through hypervisors and containerization through Linux "
-        "namespaces and control groups, and conclude with how the shift to cloud computing "
-        "and serverless functions has dissolved the boundary between operating system and "
-        "infrastructure, raising fundamental questions about what resource management and "
-        "isolation mean at planetary scale."
+        "Can you summarize the evolution of programming languages? "
+        "Start from assembly and machine code, and trace the key "
+        "steps up to modern high-level languages like Python and Rust."
     ),
     (
-        "Analyze in complete technical depth the evolution of computer networking from the "
-        "theoretical origins of packet switching through ARPANET, the TCP/IP protocol suite, "
-        "the explosive growth of the commercial internet, and into the current era of "
-        "software-defined networking, hyperscale data center fabrics, and global content "
-        "delivery infrastructure. Begin with the concept of circuit switching as used in "
-        "traditional telephony, explaining why maintaining a dedicated end-to-end physical "
-        "circuit for the duration of a call is fundamentally wasteful for bursty data "
-        "communication, and how Paul Baran at RAND Corporation and Donald Davies at the "
-        "National Physical Laboratory in the United Kingdom independently and nearly "
-        "simultaneously developed the concept of packet switching in the early 1960s as "
-        "a more efficient and fault-tolerant approach. Describe the deployment of ARPANET "
-        "starting in 1969 connecting four university nodes, how the initial Network Control "
-        "Protocol proved insufficient as the network grew, and how the development of TCP/IP "
-        "by Vint Cerf and Bob Kahn through the mid-1970s provided a layered, end-to-end "
-        "architecture explicitly designed to interconnect heterogeneous underlying networks "
-        "of radically different technologies. Explain the TCP/IP protocol architecture in "
-        "technical detail: the network layer provides global addressing and best-effort "
-        "packet forwarding through IP, the transport layer provides reliable ordered delivery "
-        "with flow and congestion control through TCP or lightweight best-effort datagram "
-        "delivery through UDP, and the application layer hosts the diverse protocols "
-        "including HTTP, DNS, SMTP, and FTP that directly serve user applications. Discuss "
-        "the development of Ethernet by Robert Metcalfe and his colleagues at Xerox PARC in "
-        "1973, how it evolved through successive generations from 10 Mbps shared coaxial "
-        "cable through 100 Mbps switched Fast Ethernet and Gigabit Ethernet to the 100 Gbps "
-        "and 400 Gbps fabrics used in modern hyperscale data centers, and how switching "
-        "replaced shared media collision domains. Trace the commercialization of the internet "
-        "in the early 1990s, the invention of the World Wide Web by Tim Berners-Lee at CERN "
-        "in 1989 and its explosive growth that transformed a research network into a global "
-        "information infrastructure, and explain how this drove massive investment in backbone "
-        "networks, Internet Exchange Points where autonomous systems peer to exchange traffic, "
-        "and the submarine cable systems that carry intercontinental internet traffic. Explain "
-        "the Border Gateway Protocol and how the internet's interdomain routing functions as "
-        "a decentralized system of autonomous systems exchanging reachability information "
-        "through policy-driven path selection, the security vulnerabilities this creates "
-        "through route hijacking and prefix misconfigurations, and ongoing efforts to secure "
-        "routing through Resource Public Key Infrastructure and BGPsec. Discuss how Content "
-        "Delivery Networks emerged to address the fundamental latency and bandwidth challenges "
-        "of serving popular content at scale by distributing it to servers physically close "
-        "to end users, and conclude with the evolution of software-defined networking, network "
-        "function virtualization, and the implications of 5G for industrial automation, "
-        "vehicle connectivity, and the proliferation of connected devices at unprecedented scale."
+        "What were the most important contributions of UNIX to modern "
+        "operating systems? How did its design principles influence "
+        "Linux and other systems we use today?"
     ),
     (
-        "How did the personal computer revolution of the 1970s and 1980s fundamentally "
-        "transform computing, and what were the cascading technical, economic, social, "
-        "and cultural consequences of placing programmable computing devices in the hands "
-        "of ordinary individuals for the first time in history? Begin by establishing the "
-        "context of the early 1970s, when computers were exclusively large, enormously "
-        "expensive mainframes or smaller but still costly minicomputers accessible only to "
-        "corporations, universities, government agencies, and well-funded research "
-        "institutions, and explain what changed technically to make a personal computer "
-        "genuinely feasible: the integration of a complete CPU onto a single silicon chip "
-        "in the form of the microprocessor, which dramatically reduced the cost and physical "
-        "complexity of building a functional computer. Describe the Altair 8800, introduced "
-        "on the cover of Popular Electronics in January 1975, which used Intel's 8080 "
-        "processor and was sold as a kit for three hundred ninety-seven dollars, and explain "
-        "how it ignited an existing hobbyist community organized around the Homebrew Computer "
-        "Club in Silicon Valley and elsewhere who would form the social nucleus of the "
-        "emerging personal computing industry. Explain how Bill Gates and Paul Allen wrote "
-        "a BASIC interpreter for the Altair, founding Microsoft in 1975 to sell software "
-        "for microcomputers, and how this established the crucial business model of software "
-        "as an independent commercial product separable from the hardware on which it ran. "
-        "Describe the Apple II introduced by Steve Jobs and Steve Wozniak in 1977, which "
-        "was a complete and polished ready-to-use system with color graphics, a keyboard, "
-        "and expansion slots, and explain how the availability of VisiCalc, the first "
-        "electronic spreadsheet application, in 1979 created computing's first genuine "
-        "killer application that drove substantial business adoption of personal computers "
-        "purely for the practical productivity benefits. Discuss IBM's consequential decision "
-        "in 1980 to enter the personal computer market rapidly using an open architecture "
-        "built from commodity components, how this decision enabled a large clone industry "
-        "that drove down prices and expanded the market enormously, and how Microsoft's "
-        "retention of licensing rights to DOS rather than selling them outright proved to be "
-        "one of the most strategically consequential business decisions in the history of "
-        "technology. Explain the graphical user interface research conducted at Xerox PARC "
-        "in the 1970s, including the development of the Alto personal workstation, the "
-        "desktop metaphor with overlapping windows and icons, and the mouse as a pointing "
-        "device, and describe how these ideas influenced the Apple Lisa in 1983 and the "
-        "Macintosh in 1984 to make computing dramatically more accessible to non-technical "
-        "users. Discuss the social and economic transformations enabled by personal "
-        "computing: the democratization of document creation and desktop publishing, the "
-        "transformation of music production and creative arts through digital audio "
-        "workstations and early graphics software, the revolution in small business "
-        "accounting and productivity, and the emergence of an independent software industry "
-        "with thousands of vendors creating applications for niche markets that mainframe "
-        "economics had made impossible. Conclude with an honest assessment of the digital "
-        "divide that emerged as computer ownership correlated strongly with income, "
-        "education level, and geography, creating new forms of inequality even as it "
-        "democratized access to information and creative tools for those who could afford it."
+        "How did the personal computer revolution of the 1970s and 1980s "
+        "change society? Briefly describe the roles of Apple, IBM, and "
+        "Microsoft in making PCs widely accessible."
     ),
 ]
 
 # Stage 2에서 3번 대화 (첫 번째 = transition 직후 핵심 측정)
-# max_tokens=512, max_model_len=8192: S1 6턴 후 ~3400 토큰, S2 3턴 후 ~5300 토큰
+# S1 6턴 후 ~600 토큰, S2 3턴 후 ~900 토큰 누적
 STAGE2_PROMPTS = [
     (
-        "Provide a thorough explanation of machine learning fundamentals, covering supervised "
-        "learning, unsupervised learning, and reinforcement learning. Include the mathematical "
-        "intuition behind loss functions, gradient descent, and backpropagation. Explain how "
-        "neural network depth and width affect capacity, the role of regularization and dropout, "
-        "and why techniques like batch normalization and residual connections were so important "
-        "for training very deep networks reliably."
+        "Explain the basics of machine learning: what is supervised learning, "
+        "unsupervised learning, and reinforcement learning? Give a simple "
+        "example of each."
     ),
     (
-        "Explain the architecture and training process of transformer models in thorough detail. "
-        "How does scaled dot-product attention work, and why is multi-head attention beneficial? "
-        "What are the key differences between encoder-only models like BERT, decoder-only models "
-        "like GPT, and encoder-decoder models like T5? Why have transformers become dominant not "
-        "just in NLP but also in vision, audio, and multimodal tasks?"
+        "What is a neural network and how does backpropagation work? "
+        "Briefly explain gradient descent and why it is used to train "
+        "deep learning models."
     ),
     (
-        "What are the major challenges in training large language models at scale? Discuss "
-        "distributed training strategies including data parallelism, tensor parallelism, and "
-        "pipeline parallelism. Cover memory optimization techniques such as gradient checkpointing, "
-        "ZeRO optimizer states, mixed-precision training, and flash attention. What does the "
-        "infrastructure stack look like for training a 100B+ parameter model?"
+        "What is the transformer architecture and why did it revolutionize "
+        "natural language processing? Explain the self-attention mechanism "
+        "in simple terms."
     ),
 ]
 
 # Stage 3에서 3번 대화 (첫 번째 = transition 직후 핵심 측정)
-# S2 3턴 후 ~5300 토큰, S3 3턴 후 ~7300 토큰 < 8192
+# S2 3턴 후 ~900 토큰, S3 3턴 후 ~1200 토큰 < 4096
 STAGE3_PROMPTS = [
     (
-        "What does the current trajectory of artificial intelligence development suggest about "
-        "the next 10 to 20 years? Analyze trends in model scaling, multimodal and agentic "
-        "capabilities, reasoning and planning, and the growing use of synthetic data and "
-        "self-improvement loops. Project the likely near-term and medium-term developments, "
-        "and discuss their implications for productivity, scientific discovery, and the "
-        "concentration of economic and geopolitical power."
+        "What does the near-term future of AI look like over the next "
+        "5 to 10 years? Briefly discuss trends in model scaling, "
+        "multimodal capabilities, and AI agents."
     ),
     (
-        "How will AI automation affect employment across different sectors of the economy over "
-        "the coming decade? Analyze which occupational categories are most exposed to automation "
-        "based on task structure rather than job title. Discuss the historical precedents from "
-        "previous automation waves, what new categories of work are likely to emerge, and what "
-        "policy interventions — retraining programs, taxation of automation, universal basic "
-        "income — are being debated and what evidence exists for their effectiveness."
+        "How might AI automation affect jobs over the next decade? "
+        "Which types of work are most at risk and which new roles "
+        "might emerge as a result?"
     ),
     (
-        "Discuss the geopolitical dimensions of the AI development race, including the US-China "
-        "technology competition, export controls on advanced semiconductors, and the strategic "
-        "importance of compute infrastructure and data. How are different blocs — the US, EU, "
-        "China, and middle powers — approaching AI governance and regulation, and what does "
-        "the fragmentation of global AI norms imply for international stability and cooperation?"
+        "What are the main geopolitical issues around AI development today? "
+        "Briefly discuss the US-China technology competition and the "
+        "debate around AI regulation and governance."
     ),
 ]
 
@@ -731,7 +480,7 @@ def run_origin(model_name: str, output_path: str):
         model=model_path,
         trust_remote_code=True,
         gpu_memory_utilization=0.7,
-        max_model_len=8192,
+        max_model_len=4096,
         enforce_eager=False,
         enable_prefix_caching=True,
     )
@@ -850,7 +599,7 @@ def run_partial(model_name: str, output_path: str):
         model=model_path,
         trust_remote_code=True,
         gpu_memory_utilization=0.7,
-        max_model_len=8192,
+        max_model_len=4096,
         enforce_eager=False,
         enable_prefix_caching=True,
     )
@@ -1086,18 +835,18 @@ def compare(path_a: str, path_b: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark chatbot_origin vs chatbot_partial_cache",
+        description="Benchmark chatbot_origin vs chatbot_partial_cache (일반 프롬프트 버전)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Run origin mode
-  python benchmark_chatbots.py --mode origin --model llama --output results_origin.json
+  python benchmark_chatbots_normal.py --mode origin --model llama --output results_origin.json
 
   # Run partial mode (separate process, after origin finishes)
-  python benchmark_chatbots.py --mode partial --model llama --output results_partial.json
+  python benchmark_chatbots_normal.py --mode partial --model llama --output results_partial.json
 
   # Compare results
-  python benchmark_chatbots.py --compare results_origin.json results_partial.json
+  python benchmark_chatbots_normal.py --compare results_origin.json results_partial.json
         """,
     )
     parser.add_argument(
@@ -1127,7 +876,7 @@ Examples:
             parser.error("--output is required with --mode")
 
         print(f"\n{'='*65}")
-        print(f"  Chatbot Benchmark")
+        print(f"  Chatbot Benchmark (Normal Prompt Length)")
         print(f"  Mode:  {args.mode}")
         print(f"  Model: {args.model}")
         print(f"  GPU:   {torch.cuda.get_device_name(0)}")

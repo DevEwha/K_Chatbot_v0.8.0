@@ -556,12 +556,6 @@ class ProgressiveForCausalLM(nn.Module):
             self.current_stage = 2
             self.inactive_layer_indices = set(self._get_c_indices())
 
-            # Partial KV recomputation 설정
-            boundary = self.get_recompute_boundary(b_indices)
-            if boundary is not None:
-                self.model.set_partial_recompute(boundary)
-                print(f"[Stage2] Partial recompute enabled: boundary={boundary}")
-
             # 캐싱 범위 설정 (Stage 3 boundary-1까지)
             max_cacheable = self._get_max_cacheable_layer()
             self.model._max_cacheable_layer = max_cacheable
@@ -592,12 +586,6 @@ class ProgressiveForCausalLM(nn.Module):
         if success:
             self.current_stage = 3
             self.inactive_layer_indices = set()
-
-            # Partial KV recomputation 설정
-            boundary = self.get_recompute_boundary(c_indices)
-            if boundary is not None:
-                self.model.set_partial_recompute(boundary)
-                print(f"[Stage3] Partial recompute enabled: boundary={boundary}")
 
             # 캐싱 범위 설정 (Stage 3는 모든 레이어)
             self.model._max_cacheable_layer = None

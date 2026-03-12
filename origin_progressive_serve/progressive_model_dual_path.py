@@ -437,12 +437,14 @@ class ProgressiveModelDualPath(nn.Module):
             
             print(f"  ✅ Layer {layer_idx} activated!")
         
+        # non_blocking=True copy가 모두 GPU에서 완료될 때까지 대기
+        torch.cuda.synchronize()
         print(f"\n{'='*60}")
         print(f"LAYER ACTIVATION COMPLETE")
         print(f"Inactive layers: {self.count_inactive_layers()}")
         print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음")
         print(f"{'='*60}\n")
-    
+
     def prefetch_weights(self, checkpoint_path: str, layer_indices: List[int]) -> None:
         """
         백그라운드 스레드에서 checkpoint를 CPU 메모리에 미리 로드.
@@ -556,6 +558,8 @@ class ProgressiveModelDualPath(nn.Module):
                 self.initially_inactive.discard(layer_idx)
                 print(f"  ✅ Layer {layer_idx} activated (alpha 0→1)")
 
+            # non_blocking=True copy가 모두 GPU에서 완료될 때까지 대기
+            torch.cuda.synchronize()
             print(f"\n✅ Instant activation complete")
             print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음\n")
             return True
@@ -647,11 +651,11 @@ class ProgressiveModelDualPath(nn.Module):
             
             # 일반 weights (direct match)
             if name in layer_weights:
-                param.data.copy_(layer_weights[name].to(device))
+                param.data.copy_(layer_weights[name], non_blocking=True)
                 loaded_count += 1
-        
+
         return loaded_count
-    
+
     def _load_qkv_fused(
         self,
         param,
@@ -672,16 +676,16 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            fused_weight = torch.cat([
-                layer_weights[name] for name in weight_names
-            ], dim=0)
-            
-            param.data.copy_(fused_weight.to(device))
+            offset = 0
+            for name in weight_names:
+                w = layer_weights[name]
+                param.data[offset:offset + w.shape[0]].copy_(w, non_blocking=True)
+                offset += w.shape[0]
             print(f"  ✅ Loaded fused QKV ({len(weight_names)} weights)")
             return True
-        
+
         return False
-    
+
     def _load_mlp_fused(
         self,
         param,
@@ -704,16 +708,16 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            fused_weight = torch.cat([
-                layer_weights[name] for name in weight_names
-            ], dim=0)
-            
-            param.data.copy_(fused_weight.to(device))
+            offset = 0
+            for name in weight_names:
+                w = layer_weights[name]
+                param.data[offset:offset + w.shape[0]].copy_(w, non_blocking=True)
+                offset += w.shape[0]
             print(f"  ✅ Loaded fused MLP ({len(weight_names)} weights)")
             return True
-        
+
         return False
-    
+
     # ================================================================
     # Status Methods (CUDA Graph safe!)
     # ================================================================

@@ -30,8 +30,8 @@ Usage:
             → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
             → t_total_effective = transition + first_chat
 
-  [Partial] t_sync | t_prefetch | t_activation | t_surgery (~20ms, KV block surgery)
-            → t_total_transition (sync+surgery 포함, 빠름)
+  [Partial] t_sync | t_prefetch | t_activation | t_skbi (~20ms, Selective KV Block Injection (SKBI))
+            → t_total_transition (sync+SKBI 포함, 빠름)
             → t_first_chat  ← KV 이미 업데이트됨, prefix cache 유지 (빠름)
             → t_total_effective = transition + first_chat
 
@@ -334,9 +334,9 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
                                  conversation, sampling_params,
                                  first_prompt):
     """
-    Partial 모드 stage 전환 타이밍 측정 (KV Block Surgery).
+    Partial 모드 stage 전환 타이밍 측정 (Selective KV Block Injection (SKBI)).
 
-    단계: sync → prefetch → activation → KV block surgery (~20ms)
+    단계: sync → prefetch → activation → Selective KV Block Injection (SKBI) (~20ms)
     이후: 첫 채팅 (prefix cache 유지 → prefill 스킵 → 빠름)
     """
     tr = {}
@@ -346,19 +346,19 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     prefetch_fn = getattr(model, prefetch_fn_name)
     advance_fn  = getattr(model, advance_fn_name)
 
-    # t_sync: GPU persistent buffer → _layer_output_cache (surgery fallback용)
+    # t_sync: GPU persistent buffer → _layer_output_cache (SKBI fallback용)
     # chatbot에서 prefetch 시작 전 동기적으로 호출되므로 실제 전환 비용에 포함됨.
-    # surgery 성공 시에는 cache가 사용되지 않지만, 항상 준비해두는 것이 실제 동작.
+    # SKBI 성공 시에는 cache가 사용되지 않지만, 항상 준비해두는 것이 실제 동작.
     torch.cuda.synchronize()
     t0 = time.time()
     inner_model = getattr(model, "model", None)
     if inner_model is not None and hasattr(inner_model, "sync_persistent_cache"):
         seq_len = 0
-        if (getattr(inner_model, "_surgery_seq_lens_tensor", None) is not None
-                and inner_model._surgery_seq_lens_tensor.numel() > 0):
-            seq_len = int(inner_model._surgery_seq_lens_tensor[0].item())
+        if (getattr(inner_model, "_skbi_seq_lens_tensor", None) is not None
+                and inner_model._skbi_seq_lens_tensor.numel() > 0):
+            seq_len = int(inner_model._skbi_seq_lens_tensor[0].item())
         if seq_len > 0:
-            print(f"    → [Sync] Caching {seq_len} tokens for surgery fallback...")
+            print(f"    → [Sync] Caching {seq_len} tokens for SKBI fallback...")
             inner_model.sync_persistent_cache(seq_len)
     torch.cuda.synchronize()
     tr["t_sync_s"] = round(time.time() - t0, 3)
@@ -380,25 +380,25 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     if not ok:
         raise RuntimeError(f"{advance_fn_name} returned False")
 
-    # t_surgery: KV block surgery
+    # t_skbi: Selective KV Block Injection (SKBI)
     # - Lower layers: KV 그대로 (가중치 동일, 재계산 없음)
     # - Upper layers: 새 가중치로 KV만 덮어씀 (~20ms)
     # - Prefix cache 유지 → 다음 generate()에서 full prefix hit
     # 실패 시 fallback: reset_prefix_cache + full prefill
     torch.cuda.synchronize()
     t0 = time.time()
-    surgery_ok = False
+    skbi_ok = False
     if (hasattr(model, "get_recompute_boundary")
             and hasattr(model, get_indices_fn_name)
             and hasattr(model, "model")):
         indices = getattr(model, get_indices_fn_name)()
         boundary = model.get_recompute_boundary(indices)
         if boundary is not None:
-            surgery_ok = model.model.inject_upper_layer_kv(boundary=boundary)
+            skbi_ok = model.model.apply_skbi(boundary=boundary)
 
-    if not surgery_ok:
+    if not skbi_ok:
         # Fallback: prefix cache 초기화 후 full prefill
-        print("    → [Surgery] fallback: reset_prefix_cache + full prefill")
+        print("    → [SKBI] fallback: reset_prefix_cache + full prefill")
         minimal_params = SamplingParams(temperature=0.0, max_tokens=1)
         if len(conversation) > 0:
             prompt_now = build_prompt(tokenizer, conversation)
@@ -406,24 +406,24 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
             llm.generate([prompt_now], minimal_params)
 
     torch.cuda.synchronize()
-    tr["t_surgery_s"] = round(time.time() - t0, 3)
-    tr["surgery_ok"] = surgery_ok
+    tr["t_skbi_s"] = round(time.time() - t0, 3)
+    tr["skbi_ok"] = skbi_ok
 
     tr["t_total_transition_s"] = round(
-        tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_surgery_s"], 3
+        tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_skbi_s"], 3
     )
     tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
 
-    status = "✅ surgery" if surgery_ok else "⚠️ fallback(full prefill)"
+    status = "✅ SKBI" if skbi_ok else "⚠️ fallback(full prefill)"
     print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
           f"t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
-          f"t_surgery={tr['t_surgery_s']:.3f}s ({status}) | "
+          f"t_skbi={tr['t_skbi_s']:.3f}s ({status}) | "
           f"t_transition={tr['t_total_transition_s']:.3f}s")
-    cache_status = "preserved (prefix hit expected)" if surgery_ok else "cleared (full prefill)"
+    cache_status = "preserved (prefix hit expected)" if skbi_ok else "cleared (full prefill)"
     print(f"    → [First chat] prefix cache {cache_status}...")
 
-    # 첫 채팅 (surgery 성공 시 → new user tokens만 처리, 매우 빠름)
+    # 첫 채팅 (SKBI 성공 시 → new user tokens만 처리, 매우 빠름)
     r_first = do_chat(llm, tokenizer, conversation, first_prompt, sampling_params)
     tr["t_first_chat_s"]     = r_first["t_chat_s"]
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
@@ -758,10 +758,10 @@ def compare(path_a: str, path_b: str):
         vb_cc = tb.get("t_cache_clear_s", 0.0)
         print(fmt_row("  t_cache_clear [origin only]", va_cc, vb_cc))
 
-        # surgery (partial only) — 구 결과의 t_recompute_s도 호환
-        va_rc = ta.get("t_surgery_s", ta.get("t_recompute_s", 0.0))
-        vb_rc = tb.get("t_surgery_s", tb.get("t_recompute_s", 0.0))
-        print(fmt_row("  t_surgery/recompute [partial only]", va_rc, vb_rc))
+        # SKBI (partial only) — 구 결과의 t_recompute_s도 호환
+        va_rc = ta.get("t_skbi_s", ta.get("t_recompute_s", 0.0))
+        vb_rc = tb.get("t_skbi_s", tb.get("t_recompute_s", 0.0))
+        print(fmt_row("  t_skbi/recompute [partial only]", va_rc, vb_rc))
 
         print(fmt_row("  t_total_transition",
                       ta.get("t_total_transition_s"), tb.get("t_total_transition_s")))
@@ -824,7 +824,7 @@ def compare(path_a: str, path_b: str):
     print("\n  NOTE:")
     print("  - t_first_chat in Origin = FULL PREFILL (all tokens recomputed, slow)")
     print("  - t_first_chat in Partial = only new user tokens processed (fast, prefix cache hit)")
-    print("  - t_surgery in Partial = KV block surgery: upper layers only (~20ms)")
+    print("  - t_skbi in Partial = Selective KV Block Injection (SKBI): upper layers only (~20ms)")
     print("    (lower layers KV untouched; prefix cache preserved → next generate skips prefill)")
     print("=" * W)
 

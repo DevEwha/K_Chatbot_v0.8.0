@@ -118,10 +118,10 @@ class ProgressiveModelDualPath(nn.Module):
         # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
         self._max_cacheable_layer: Optional[int] = None
 
-        # ── KV Block Surgery ──
+        # ── Selective KV Block Injection (SKBI) ──
         # Decode 단계에서 저장: full sequence의 physical block mapping
-        self._surgery_block_tables: Optional[torch.Tensor] = None  # [1, max_blocks]
-        self._surgery_seq_lens_tensor: Optional[torch.Tensor] = None  # [1]
+        self._skbi_block_tables: Optional[torch.Tensor] = None  # [1, max_blocks]
+        self._skbi_seq_lens_tensor: Optional[torch.Tensor] = None  # [1]
 
         # ── Persistent GPU Buffers (CUDA graph safe) ──
         # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
@@ -385,7 +385,7 @@ class ProgressiveModelDualPath(nn.Module):
         - All operations on GPU tensors
         """
 
-        # KV Surgery: decode step마다 block_tables를 view로 저장.
+        # SKBI: decode step마다 block_tables를 view로 저장.
         # view를 사용하는 이유: CUDA graph replay 시 prepare_graph_input_buffers()가
         # 원본 텐서를 in-place 업데이트하면 view도 자동으로 최신 값을 반영.
         # clone()을 사용하면 graph 캡처 시점의 dummy 값이 고정되어 버그 발생.
@@ -398,8 +398,8 @@ class ProgressiveModelDualPath(nn.Module):
                     and _fwd_meta.block_tables.numel() > 0
                     and getattr(_fwd_meta, 'seq_lens_tensor', None) is not None
                     and _fwd_meta.seq_lens_tensor.numel() > 0):
-                self._surgery_block_tables = _fwd_meta.block_tables[:1]
-                self._surgery_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
+                self._skbi_block_tables = _fwd_meta.block_tables[:1]
+                self._skbi_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
         except Exception:
             pass
 
@@ -634,16 +634,16 @@ class ProgressiveModelDualPath(nn.Module):
         self._partial_recompute_boundary = None
 
     # ================================================================
-    # True KV Block Surgery
+    # Selective KV Block Injection (SKBI)
     # ================================================================
 
-    def inject_upper_layer_kv(
+    def apply_skbi(
         self,
         boundary: int,
         seq_len: Optional[int] = None,
     ) -> bool:
         """
-        Stage 전환 시 upper layer KV만 업데이트하는 진짜 KV block surgery.
+        Stage 전환 시 upper layer KV만 업데이트하는 Selective KV Block Injection (SKBI).
 
         원리:
         - Lower layers (0..boundary-1): 가중치 동일 → KV 불변 → 손대지 않음
@@ -652,42 +652,42 @@ class ProgressiveModelDualPath(nn.Module):
         - 결과: 다음 generate()에서 prefill 완전 스킵
 
         Returns:
-            True: surgery 성공
+            True: SKBI 성공
             False: 실패 (호출자가 reset_prefix_cache + partial recompute로 fallback)
         """
         if not self._persistent_buffers_initialized:
-            print("[Surgery] ❌ Persistent buffers not initialized")
+            print("[SKBI] ❌ Persistent buffers not initialized")
             return False
 
-        if self._surgery_block_tables is None:
-            print("[Surgery] ❌ No block tables saved (no decode step happened yet)")
+        if self._skbi_block_tables is None:
+            print("[SKBI] ❌ No block tables saved (no decode step happened yet)")
             return False
 
         # seq_len 결정
         if seq_len is None:
-            if self._surgery_seq_lens_tensor is None:
-                print("[Surgery] ❌ No seq_lens_tensor saved")
+            if self._skbi_seq_lens_tensor is None:
+                print("[SKBI] ❌ No seq_lens_tensor saved")
                 return False
-            seq_len = int(self._surgery_seq_lens_tensor[0].item())
+            seq_len = int(self._skbi_seq_lens_tensor[0].item())
 
         if seq_len < 1:
-            print(f"[Surgery] ❌ Invalid seq_len={seq_len}")
+            print(f"[SKBI] ❌ Invalid seq_len={seq_len}")
             return False
 
         if boundary <= 0 or boundary >= len(self.layers):
-            print(f"[Surgery] ❌ Invalid boundary {boundary} for {len(self.layers)} layers")
+            print(f"[SKBI] ❌ Invalid boundary {boundary} for {len(self.layers)} layers")
             return False
 
         device = self._persistent_h_buffers[0].device
         block_size = self.vllm_config.cache_config.block_size
         num_blocks_needed = (seq_len + block_size - 1) // block_size
 
-        if self._surgery_block_tables.shape[1] < num_blocks_needed:
-            print(f"[Surgery] ❌ Not enough blocks: have {self._surgery_block_tables.shape[1]}, "
+        if self._skbi_block_tables.shape[1] < num_blocks_needed:
+            print(f"[SKBI] ❌ Not enough blocks: have {self._skbi_block_tables.shape[1]}, "
                   f"need {num_blocks_needed} for seq_len={seq_len}")
             return False
 
-        print(f"\n[Surgery] 🔪 KV block surgery starting")
+        print(f"\n[SKBI] 🔪 Selective KV Block Injection (SKBI) starting")
         print(f"  Lower layers 0~{boundary-1}: KV 보존 (가중치 동일, 연산 없음)")
         print(f"  Upper layers {boundary}~{len(self.layers)-1}: 새 가중치로 KV 재계산")
         print(f"  Seq len: {seq_len} tokens | Blocks: {num_blocks_needed}")
@@ -695,11 +695,11 @@ class ProgressiveModelDualPath(nn.Module):
         # block_tables에서 slot_mapping 재구성
         try:
             slot_mapping = self._reconstruct_slot_mapping(
-                self._surgery_block_tables[:1, :num_blocks_needed],
+                self._skbi_block_tables[:1, :num_blocks_needed],
                 seq_len, block_size, device,
             )
         except Exception as e:
-            print(f"[Surgery] ❌ slot_mapping 재구성 실패: {e}")
+            print(f"[SKBI] ❌ slot_mapping 재구성 실패: {e}")
             return False
 
         # boundary-1 레이어의 출력 = boundary 레이어의 입력
@@ -708,13 +708,13 @@ class ProgressiveModelDualPath(nn.Module):
 
         positions = torch.arange(seq_len, device=device, dtype=torch.long)
 
-        # Surgery용 FlashAttentionMetadata 구성
+        # SKBI용 FlashAttentionMetadata 구성
         # context_lens_tensor=zeros → 전체 seq_len 토큰을 fresh prefill로 처리
         # → K,V cache write + full causal attention 계산
         try:
             from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 
-            surgery_meta = FlashAttentionMetadata(
+            skbi_meta = FlashAttentionMetadata(
                 num_prefills=1,
                 num_prefill_tokens=seq_len,
                 num_decode_tokens=0,
@@ -728,7 +728,7 @@ class ProgressiveModelDualPath(nn.Module):
                 max_decode_seq_len=0,
                 context_lens_tensor=torch.zeros(
                     1, dtype=torch.int32, device=device),
-                block_tables=self._surgery_block_tables[:1, :num_blocks_needed],
+                block_tables=self._skbi_block_tables[:1, :num_blocks_needed],
                 use_cuda_graph=False,
                 max_query_len=seq_len,
                 query_start_loc=torch.tensor(
@@ -738,18 +738,18 @@ class ProgressiveModelDualPath(nn.Module):
                 max_decode_query_len=0,
             )
         except Exception as e:
-            print(f"[Surgery] ❌ Metadata 생성 실패: {e}")
+            print(f"[SKBI] ❌ Metadata 생성 실패: {e}")
             import traceback
             traceback.print_exc()
             return False
 
-        # Upper layers를 surgery ForwardContext 안에서 직접 실행
+        # Upper layers를 SKBI ForwardContext 안에서 직접 실행
         t0 = time.perf_counter()
         try:
             from vllm.forward_context import set_forward_context
             with torch.inference_mode():
                 with set_forward_context(
-                    surgery_meta, self.vllm_config, virtual_engine=0
+                    skbi_meta, self.vllm_config, virtual_engine=0
                 ):
                     for layer_idx in range(boundary, len(self.layers)):
                         layer_wrapper = self.layers[layer_idx]
@@ -776,14 +776,14 @@ class ProgressiveModelDualPath(nn.Module):
                             r = residual_b
 
         except Exception as e:
-            print(f"[Surgery] ❌ Surgery forward 실패: {e}")
+            print(f"[SKBI] ❌ SKBI forward 실패: {e}")
             import traceback
             traceback.print_exc()
             return False
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        print(f"  ✅ KV surgery 완료 ({elapsed_ms:.1f} ms)")
+        print(f"  ✅ SKBI 완료 ({elapsed_ms:.1f} ms)")
         print(f"  📌 Lower (0~{boundary-1}): KV 그대로 (재계산 없음)")
         print(f"  📌 Upper ({boundary}~{len(self.layers)-1}): KV 업데이트됨")
         print(f"  📌 Prefix cache 유지 → 다음 generate()에서 prefill 스킵\n")
@@ -1029,7 +1029,7 @@ class ProgressiveModelDualPath(nn.Module):
                 print(f"  ✅ Layer {layer_idx} activated (alpha 0→1)")
 
             # non_blocking=True copy가 모두 GPU에서 완료될 때까지 대기
-            # surgery / forward가 이 weights를 즉시 사용하므로 필수
+            # SKBI / forward가 이 weights를 즉시 사용하므로 필수
             torch.cuda.synchronize()
             print(f"\n✅ Instant activation complete")
             print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음\n")

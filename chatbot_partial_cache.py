@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Progressive Serving Chatbot - True KV Block Surgery
+Progressive Serving Chatbot - Selective KV Block Injection (SKBI)
 =====================================================
 
 Interactive chatbot with progressive model serving (vLLM v0 engine).
 Stage transitions on user command (/stage2, /stage3).
 
-**핵심 동작 (True KV Block Surgery):**
+**핵심 동작 (Selective KV Block Injection (SKBI)):**
 - KV Cache를 턴 사이에 유지 (prefix caching)
 - Stage 전환 시:
   * Lower layers (boundary 이전): KV cache 전혀 손대지 않음 (가중치 동일 → KV 동일)
   * Upper layers (boundary 이후): 동일 physical block에 새 가중치로 KV 덮어쓰기
   * vLLM prefix cache hash→block 매핑 유지 → 다음 generate()에서 prefill 완전 스킵!
-- Fallback: surgery 실패 시 reset_prefix_cache + partial recompute
+- Fallback: SKBI 실패 시 reset_prefix_cache + partial recompute
 
 Usage:
   python chatbot_partial_cache.py --model llama
   python chatbot_partial_cache.py --model mistral
 
   Commands during chat:
-    /stage2  - Transition to Stage 2 (KV block surgery)
-    /stage3  - Transition to Stage 3 (KV block surgery)
+    /stage2  - Transition to Stage 2 (Selective KV Block Injection (SKBI))
+    /stage3  - Transition to Stage 3 (Selective KV Block Injection (SKBI))
     /status  - Show model status
     /reset   - Reset conversation
     /quit    - Exit
@@ -67,20 +67,20 @@ MODELS = {
 
 
 # ============================================================================
-# Chatbot with True KV Block Surgery
+# Chatbot with Selective KV Block Injection (SKBI)
 # ============================================================================
 
 class ProgressiveChatbotPartial:
     """
-    Progressive Serving 기반 대화형 챗봇 (True KV Block Surgery)
+    Progressive Serving 기반 대화형 챗봇 (Selective KV Block Injection (SKBI))
 
     핵심 기능:
     - KV Cache 턴 간 유지 (vLLM prefix caching)
-    - Stage 전환 시 KV block surgery:
+    - Stage 전환 시 Selective KV Block Injection (SKBI):
       * Lower layers: KV 완전 보존 (연산 없음)
       * Upper layers: 동일 physical block에 새 KV 덮어쓰기
       * 다음 generate()에서 prefill 스킵 → 진짜 zero-overhead transition
-    - Surgery 실패 시 fallback: reset + partial recompute
+    - SKBI 실패 시 fallback: reset + partial recompute
     """
 
     def __init__(self, model_name: str):
@@ -125,7 +125,7 @@ class ProgressiveChatbotPartial:
             max_tokens=512,
         )
 
-        print(f"  ✅ True KV Block Surgery enabled")
+        print(f"  ✅ Selective KV Block Injection (SKBI) enabled")
         print(f"  ✅ Prefix caching enabled (KV cache persists between turns)")
 
     def _get_model_handle(self):
@@ -171,9 +171,9 @@ class ProgressiveChatbotPartial:
     def _get_current_seq_len(self) -> int:
         """현재 시퀀스 길이 반환 (vLLM 내부 저장값 우선)"""
         inner = self.model.model
-        if (inner._surgery_seq_lens_tensor is not None
-                and inner._surgery_seq_lens_tensor.numel() > 0):
-            return int(inner._surgery_seq_lens_tensor[0].item())
+        if (inner._skbi_seq_lens_tensor is not None
+                and inner._skbi_seq_lens_tensor.numel() > 0):
+            return int(inner._skbi_seq_lens_tensor[0].item())
         # Fallback: tokenizer로 직접 계산
         if self.conversation:
             prompt = self._build_prompt()
@@ -206,7 +206,7 @@ class ProgressiveChatbotPartial:
         return response
 
     # ----------------------------------------------------------------
-    # Stage 전환 (True KV Block Surgery)
+    # Stage 전환 (Selective KV Block Injection (SKBI))
     # ----------------------------------------------------------------
     def advance_to_stage2(self) -> bool:
         """
@@ -214,11 +214,11 @@ class ProgressiveChatbotPartial:
 
         1. 가중치 prefetch (백그라운드)
         2. 가중치 instant activation (GPU copy)
-        3. KV Block Surgery:
+        3. Selective KV Block Injection (SKBI):
            - Lower layers: KV 그대로 (연산 없음)
            - Upper layers: 동일 block에 새 KV 덮어쓰기
            - prefix cache 유지 → 다음 generate() prefill 스킵
-        4. Surgery 실패 시: reset_prefix_cache + partial recompute fallback
+        4. SKBI 실패 시: reset_prefix_cache + partial recompute fallback
         """
         if self.current_stage >= 2:
             print("  Already at Stage 2 or higher.")
@@ -234,8 +234,8 @@ class ProgressiveChatbotPartial:
         boundary = self.model.get_recompute_boundary(b_indices)
         has_conversation = len(self.conversation) > 0
 
-        # Surgery fallback을 위해 hidden state 캐시 미리 준비
-        # (surgery 실패 시 partial recompute에서 사용)
+        # SKBI fallback을 위해 hidden state 캐시 미리 준비
+        # (SKBI 실패 시 partial recompute에서 사용)
         if has_conversation and boundary is not None:
             seq_len = self._get_current_seq_len()
             if seq_len > 0 and hasattr(inner_model, 'sync_persistent_cache'):
@@ -265,17 +265,17 @@ class ProgressiveChatbotPartial:
         print(f"  Active layers: {len(stage_info['active_layers'])}, "
               f"Progress: {stage_info['activation_progress']}")
 
-        # ── KV Block Surgery ──
+        # ── Selective KV Block Injection (SKBI) ──
         if has_conversation and boundary is not None:
-            surgery_ok = inner_model.inject_upper_layer_kv(boundary)
+            skbi_ok = inner_model.apply_skbi(boundary)
 
-            if not surgery_ok:
+            if not skbi_ok:
                 # Fallback: reset prefix cache + partial recompute
-                print("  [Stage2] ⚠️ Surgery 실패, partial recompute fallback 실행")
+                print("  [Stage2] ⚠️ SKBI 실패, partial recompute fallback 실행")
                 inner_model.set_partial_recompute(boundary)
                 self.llm.reset_prefix_cache()
                 self._trigger_partial_recompute()
-            # else: surgery 성공 → prefix cache 유지 → 다음 generate()에서 prefill 스킵
+            # else: SKBI 성공 → prefix cache 유지 → 다음 generate()에서 prefill 스킵
 
         elif not has_conversation:
             # 대화 없음: prefix cache만 초기화 (upper layer KV = zeros였음)
@@ -287,7 +287,7 @@ class ProgressiveChatbotPartial:
         """
         Stage 2 → Stage 3 전환
 
-        동일 KV Block Surgery 방식 적용.
+        동일 Selective KV Block Injection (SKBI) 방식 적용.
         """
         if self.current_stage < 2:
             print("  Must be at Stage 2 first. Use /stage2.")
@@ -306,7 +306,7 @@ class ProgressiveChatbotPartial:
         boundary = self.model.get_recompute_boundary(c_indices)
         has_conversation = len(self.conversation) > 0
 
-        # Surgery fallback용 hidden state 캐시 준비
+        # SKBI fallback용 hidden state 캐시 준비
         if has_conversation and boundary is not None:
             seq_len = self._get_current_seq_len()
             if seq_len > 0 and hasattr(inner_model, 'sync_persistent_cache'):
@@ -335,12 +335,12 @@ class ProgressiveChatbotPartial:
         print(f"  Active layers: {len(stage_info['active_layers'])}, "
               f"Progress: {stage_info['activation_progress']}")
 
-        # ── KV Block Surgery ──
+        # ── Selective KV Block Injection (SKBI) ──
         if has_conversation and boundary is not None:
-            surgery_ok = inner_model.inject_upper_layer_kv(boundary)
+            skbi_ok = inner_model.apply_skbi(boundary)
 
-            if not surgery_ok:
-                print("  [Stage3] ⚠️ Surgery 실패, partial recompute fallback 실행")
+            if not skbi_ok:
+                print("  [Stage3] ⚠️ SKBI 실패, partial recompute fallback 실행")
                 inner_model.set_partial_recompute(boundary)
                 self.llm.reset_prefix_cache()
                 self._trigger_partial_recompute()
@@ -355,7 +355,7 @@ class ProgressiveChatbotPartial:
     # ----------------------------------------------------------------
     def _trigger_partial_recompute(self):
         """
-        Surgery 실패 시 fallback: 현재 대화로 partial KV recompute 실행.
+        SKBI 실패 시 fallback: 현재 대화로 partial KV recompute 실행.
 
         reset_prefix_cache() 이후에 호출 (새 블록 할당 필요).
         """
@@ -398,7 +398,7 @@ class ProgressiveChatbotPartial:
                 inner.clear_hidden_cache()
             if hasattr(inner, 'clear_persistent_buffers'):
                 inner.clear_persistent_buffers()
-            # _surgery_block_tables / _surgery_seq_lens_tensor는 CUDA graph input buffer의 view임
+            # _skbi_block_tables / _skbi_seq_lens_tensor는 CUDA graph input buffer의 view임
             # → 초기화 불필요: 다음 decode step에서 자동으로 새 대화의 값으로 업데이트됨
             print("  Conversation and hidden caches reset.")
         else:
@@ -410,9 +410,9 @@ class ProgressiveChatbotPartial:
         inner_model = self.model.model
 
         partial_mode = inner_model._partial_recompute_boundary is not None
-        # Surgery state는 CUDA graph view → has_conversation일 때만 유효
-        has_valid_surgery_state = (
-            inner_model._surgery_block_tables is not None
+        # SKBI state는 CUDA graph view → has_conversation일 때만 유효
+        has_valid_skbi_state = (
+            inner_model._skbi_block_tables is not None
             and len(self.conversation) > 0
         )
 
@@ -424,7 +424,7 @@ class ProgressiveChatbotPartial:
         print(f"  Progress: {stage_info['activation_progress']}")
         print(f"  Turns:    {len(self.conversation) // 2}")
         print(f"  GPU Mem:  {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
-        print(f"  Surgery Ready: {'Yes' if has_valid_surgery_state else 'No (no conversation yet)'}")
+        print(f"  SKBI Ready: {'Yes' if has_valid_skbi_state else 'No (no conversation yet)'}")
         if partial_mode:
             print(f"  Partial Recompute: Active (boundary={inner_model._partial_recompute_boundary})")
         print(f"  {'='*50}")
@@ -436,7 +436,7 @@ class ProgressiveChatbotPartial:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Progressive Serving Chatbot (True KV Block Surgery)"
+        description="Progressive Serving Chatbot (Selective KV Block Injection (SKBI))"
     )
     parser.add_argument(
         "--model",
@@ -448,7 +448,7 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "=" * 60)
-    print("Progressive Serving Chatbot - True KV Block Surgery")
+    print("Progressive Serving Chatbot - Selective KV Block Injection (SKBI)")
     print(f"  Model: {args.model}")
     print(f"  GPU:   {torch.cuda.get_device_name(0)}")
     print("=" * 60)
@@ -458,7 +458,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Ready! (Stage {chatbot.current_stage})")
     print(f"  Commands: /stage2, /stage3, /status, /reset, /quit")
-    print(f"  🔪 KV Block Surgery: upper layers overwritten in-place")
+    print(f"  🔪 Selective KV Block Injection (SKBI): upper layers overwritten in-place")
     print(f"  🚀 Prefix cache preserved → next generate() skips prefill")
     print(f"{'='*60}\n")
 

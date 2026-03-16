@@ -37,6 +37,9 @@ import json
 import time
 import argparse
 import subprocess
+import threading
+
+import psutil
 
 os.environ["VLLM_USE_V1"] = "0"
 
@@ -458,6 +461,74 @@ def gpu_mem_gb() -> float:
     return torch.cuda.memory_allocated() / (1024 ** 3)
 
 
+def gpu_reserved_gb() -> float:
+    return torch.cuda.memory_reserved() / (1024 ** 3)
+
+
+def gpu_peak_allocated_gb() -> float:
+    return torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+
+def gpu_peak_reserved_gb() -> float:
+    return torch.cuda.max_memory_reserved() / (1024 ** 3)
+
+
+def cpu_mem_gb() -> float:
+    return psutil.Process().memory_info().rss / (1024 ** 3)
+
+
+def ckpt_size_gb(path: str) -> float:
+    return os.path.getsize(path) / (1024 ** 3)
+
+
+class ResourceSampler:
+    """
+    백그라운드에서 CPU/GPU 메모리 및 CPU 활용률을 주기적으로 샘플링.
+    prefetch처럼 오래 걸리는 단계의 피크 자원 사용량 측정에 사용.
+    """
+    def __init__(self, interval_s: float = 0.05):
+        self.interval = interval_s
+        self._samples: list = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._proc = psutil.Process()
+
+    def start(self):
+        self._stop.clear()
+        self._samples = []
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        if not self._samples:
+            return {}
+        cpu_mems   = [s["cpu_mem_gb"]  for s in self._samples]
+        gpu_mems   = [s["gpu_mem_gb"]  for s in self._samples]
+        cpu_pcts   = [s["cpu_pct"]     for s in self._samples]
+        return {
+            "n_samples":        len(self._samples),
+            "cpu_mem_peak_gb":  round(max(cpu_mems), 3),
+            "cpu_mem_mean_gb":  round(sum(cpu_mems) / len(cpu_mems), 3),
+            "gpu_mem_peak_gb":  round(max(gpu_mems), 3),
+            "cpu_pct_mean":     round(sum(cpu_pcts) / len(cpu_pcts), 1),
+            "cpu_pct_peak":     round(max(cpu_pcts), 1),
+        }
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._samples.append({
+                    "cpu_mem_gb": self._proc.memory_info().rss / (1024 ** 3),
+                    "gpu_mem_gb": torch.cuda.memory_allocated() / (1024 ** 3),
+                    "cpu_pct":    self._proc.cpu_percent(),
+                })
+            except Exception:
+                pass
+
+
 def get_model_handle(llm):
     """v0 엔진 progressive model handle 가져오기"""
     engine = llm.llm_engine
@@ -512,7 +583,9 @@ def do_chat(llm, tokenizer, conversation, user_input, sampling_params):
         "n_input_tokens": n_input,
         "n_gen_tokens": n_gen,
         "tokens_per_sec": round(n_gen / t_chat, 1) if t_chat > 0 else 0.0,
-        "gpu_mem_gb": round(gpu_mem_gb(), 3),
+        "gpu_allocated_gb": round(gpu_mem_gb(), 3),
+        "gpu_reserved_gb":  round(gpu_reserved_gb(), 3),
+        "cpu_mem_gb":       round(cpu_mem_gb(), 3),
     }
 
 
@@ -533,15 +606,31 @@ def _measure_transition_origin(llm, model, tokenizer, config, stage_key,
     prefetch_fn = getattr(model, prefetch_fn_name)
     advance_fn  = getattr(model, advance_fn_name)
 
-    # t_prefetch: checkpoint CPU 로드 + 대기
+    _ckpt_gb = ckpt_size_gb(checkpoint_path)
+    tr["ckpt_size_gb"] = round(_ckpt_gb, 3)
+
+    # 전환 전 스냅샷
+    torch.cuda.reset_peak_memory_stats()
+    tr["cpu_mem_before_gb"]        = round(cpu_mem_gb(), 3)
+    tr["gpu_allocated_before_gb"]  = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_before_gb"]   = round(gpu_reserved_gb(), 3)
+
+    # t_prefetch: checkpoint CPU 로드 + 대기 (백그라운드 샘플링)
+    sampler = ResourceSampler(interval_s=0.05)
+    sampler.start()
     torch.cuda.synchronize()
     t0 = time.time()
     prefetch_fn(checkpoint_path)
     model.wait_for_prefetch(timeout_s=120.0)
     torch.cuda.synchronize()
     tr["t_prefetch_s"] = round(time.time() - t0, 3)
+    tr["prefetch_resources"] = sampler.stop()
+
+    # prefetch 직후 스냅샷 (CPU에 ckpt 올라온 상태)
+    tr["cpu_mem_after_prefetch_gb"] = round(cpu_mem_gb(), 3)
 
     # t_activation: GPU weight copy + alpha 변경
+    torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     t0 = time.time()
     ok = advance_fn(wait_if_needed=False)
@@ -549,6 +638,13 @@ def _measure_transition_origin(llm, model, tokenizer, config, stage_key,
     tr["t_activation_s"] = round(time.time() - t0, 3)
     if not ok:
         raise RuntimeError(f"{advance_fn_name} returned False")
+
+    # H2D 대역폭: ckpt 크기 / activation 시간
+    tr["h2d_bandwidth_gb_s"] = round(
+        _ckpt_gb / tr["t_activation_s"], 2) if tr["t_activation_s"] > 0 else 0.0
+    tr["gpu_allocated_after_activation_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_activation_gb"]  = round(gpu_reserved_gb(), 3)
+    tr["gpu_peak_allocated_activation_gb"]  = round(gpu_peak_allocated_gb(), 3)
 
     # t_cache_clear: prefix cache 초기화 (다음 turn에서 full prefill 자동)
     t0 = time.time()
@@ -558,13 +654,18 @@ def _measure_transition_origin(llm, model, tokenizer, config, stage_key,
     tr["t_total_transition_s"] = round(
         tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_cache_clear_s"], 3
     )
-    tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_allocated_after_transition_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_transition_gb"]  = round(gpu_reserved_gb(), 3)
+    tr["cpu_mem_after_transition_gb"]       = round(cpu_mem_gb(), 3)
 
     # 첫 채팅 (FULL PREFILL: KV cache가 모두 비워졌으므로)
     print(f"    → t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
           f"t_cache_clear={tr['t_cache_clear_s']:.3f}s | "
           f"t_transition={tr['t_total_transition_s']:.3f}s")
+    print(f"    → H2D bw={tr['h2d_bandwidth_gb_s']:.2f} GB/s | "
+          f"CPU RAM peak={tr['prefetch_resources'].get('cpu_mem_peak_gb', '?'):.3f} GB | "
+          f"CPU util={tr['prefetch_resources'].get('cpu_pct_mean', '?'):.1f}% avg")
     print(f"    → [First chat] FULL PREFILL (KV cache cleared)...")
 
     r_first = do_chat(llm, tokenizer, conversation, first_prompt, sampling_params)
@@ -572,6 +673,8 @@ def _measure_transition_origin(llm, model, tokenizer, config, stage_key,
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
     tr["first_chat_n_gen"]    = r_first["n_gen_tokens"]
     tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_first_chat_s"], 3)
+    tr["gpu_allocated_after_first_chat_gb"] = r_first["gpu_allocated_gb"]
+    tr["gpu_reserved_after_first_chat_gb"]  = r_first["gpu_reserved_gb"]
 
     print(f"    → t_first_chat={tr['t_first_chat_s']:.3f}s  "
           f"t_total_effective={tr['t_total_effective_s']:.3f}s")
@@ -597,9 +700,16 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     prefetch_fn = getattr(model, prefetch_fn_name)
     advance_fn  = getattr(model, advance_fn_name)
 
+    _ckpt_gb = ckpt_size_gb(checkpoint_path)
+    tr["ckpt_size_gb"] = round(_ckpt_gb, 3)
+
+    # 전환 전 스냅샷
+    torch.cuda.reset_peak_memory_stats()
+    tr["cpu_mem_before_gb"]        = round(cpu_mem_gb(), 3)
+    tr["gpu_allocated_before_gb"]  = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_before_gb"]   = round(gpu_reserved_gb(), 3)
+
     # t_sync: GPU persistent buffer → _layer_output_cache (SKBI fallback용)
-    # chatbot에서 prefetch 시작 전 동기적으로 호출되므로 실제 전환 비용에 포함됨.
-    # SKBI 성공 시에는 cache가 사용되지 않지만, 항상 준비해두는 것이 실제 동작.
     torch.cuda.synchronize()
     t0 = time.time()
     inner_model = getattr(model, "model", None)
@@ -613,16 +723,25 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
             inner_model.sync_persistent_cache(seq_len)
     torch.cuda.synchronize()
     tr["t_sync_s"] = round(time.time() - t0, 3)
+    tr["gpu_allocated_after_sync_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_sync_gb"]  = round(gpu_reserved_gb(), 3)
 
-    # t_prefetch: checkpoint CPU 로드 + 대기
+    # t_prefetch: checkpoint CPU 로드 + 대기 (백그라운드 샘플링)
+    sampler = ResourceSampler(interval_s=0.05)
+    sampler.start()
     torch.cuda.synchronize()
     t0 = time.time()
     prefetch_fn(checkpoint_path)
     model.wait_for_prefetch(timeout_s=120.0)
     torch.cuda.synchronize()
     tr["t_prefetch_s"] = round(time.time() - t0, 3)
+    tr["prefetch_resources"] = sampler.stop()
+
+    # prefetch 직후 스냅샷 (CPU에 ckpt 올라온 상태)
+    tr["cpu_mem_after_prefetch_gb"] = round(cpu_mem_gb(), 3)
 
     # t_activation: GPU weight copy + boundary 설정
+    torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     t0 = time.time()
     ok = advance_fn(wait_if_needed=False)
@@ -631,11 +750,14 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     if not ok:
         raise RuntimeError(f"{advance_fn_name} returned False")
 
+    # H2D 대역폭
+    tr["h2d_bandwidth_gb_s"] = round(
+        _ckpt_gb / tr["t_activation_s"], 2) if tr["t_activation_s"] > 0 else 0.0
+    tr["gpu_allocated_after_activation_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_activation_gb"]  = round(gpu_reserved_gb(), 3)
+    tr["gpu_peak_allocated_activation_gb"]  = round(gpu_peak_allocated_gb(), 3)
+
     # t_skbi: Selective KV Block Injection (SKBI)
-    # - Lower layers: KV 그대로 (가중치 동일, 재계산 없음)
-    # - Upper layers: 새 가중치로 KV만 덮어씀 (~20ms)
-    # - Prefix cache 유지 → 다음 generate()에서 full prefix hit
-    # 실패 시 fallback: reset_prefix_cache + full prefill
     torch.cuda.synchronize()
     t0 = time.time()
     skbi_ok = False
@@ -659,11 +781,15 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     torch.cuda.synchronize()
     tr["t_skbi_s"] = round(time.time() - t0, 3)
     tr["skbi_ok"] = skbi_ok
+    tr["gpu_allocated_after_skbi_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_skbi_gb"]  = round(gpu_reserved_gb(), 3)
 
     tr["t_total_transition_s"] = round(
         tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_skbi_s"], 3
     )
-    tr["gpu_mem_after_transition_gb"] = round(gpu_mem_gb(), 3)
+    tr["cpu_mem_after_transition_gb"]       = round(cpu_mem_gb(), 3)
+    tr["gpu_allocated_after_transition_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_transition_gb"]  = round(gpu_reserved_gb(), 3)
 
     status = "✅ SKBI" if skbi_ok else "⚠️ fallback(full prefill)"
     print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
@@ -671,6 +797,9 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
           f"t_activation={tr['t_activation_s']:.3f}s | "
           f"t_skbi={tr['t_skbi_s']:.3f}s ({status}) | "
           f"t_transition={tr['t_total_transition_s']:.3f}s")
+    print(f"    → H2D bw={tr['h2d_bandwidth_gb_s']:.2f} GB/s | "
+          f"CPU RAM peak={tr['prefetch_resources'].get('cpu_mem_peak_gb', '?'):.3f} GB | "
+          f"CPU util={tr['prefetch_resources'].get('cpu_pct_mean', '?'):.1f}% avg")
     cache_status = "preserved (prefix hit expected)" if skbi_ok else "cleared (full prefill)"
     print(f"    → [First chat] prefix cache {cache_status}...")
 
@@ -680,6 +809,8 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
     tr["first_chat_n_gen"]    = r_first["n_gen_tokens"]
     tr["t_total_effective_s"] = round(tr["t_total_transition_s"] + tr["t_first_chat_s"], 3)
+    tr["gpu_allocated_after_first_chat_gb"] = r_first["gpu_allocated_gb"]
+    tr["gpu_reserved_after_first_chat_gb"]  = r_first["gpu_reserved_gb"]
 
     print(f"    → t_first_chat={tr['t_first_chat_s']:.3f}s  "
           f"t_total_effective={tr['t_total_effective_s']:.3f}s")
@@ -741,13 +872,17 @@ def run_origin(model_name: str, output_path: str):
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=1)
 
-    print(f"  ✅ Loaded in {t_load:.1f}s  GPU={gpu_mem_gb():.2f}GB")
+    print(f"  ✅ Loaded in {t_load:.1f}s  "
+          f"GPU alloc={gpu_mem_gb():.2f}GB  reserved={gpu_reserved_gb():.2f}GB  "
+          f"CPU RAM={cpu_mem_gb():.2f}GB")
 
     results = {
         "mode": "origin",
         "model": model_name,
         "t_load_s": round(t_load, 2),
-        "gpu_mem_after_load_gb": round(gpu_mem_gb(), 3),
+        "gpu_allocated_after_load_gb": round(gpu_mem_gb(), 3),
+        "gpu_reserved_after_load_gb":  round(gpu_reserved_gb(), 3),
+        "cpu_mem_after_load_gb":       round(cpu_mem_gb(), 3),
         "stage1_chats": [],
         "stage1_to_2": {},
         "stage2_chats": [],
@@ -865,13 +1000,17 @@ def run_partial(model_name: str, output_path: str):
         model.model.clear_persistent_buffers()
         print(f"  ✅ Persistent GPU buffers cleared (warmup residue removed)")
 
-    print(f"  ✅ Loaded in {t_load:.1f}s  GPU={gpu_mem_gb():.2f}GB")
+    print(f"  ✅ Loaded in {t_load:.1f}s  "
+          f"GPU alloc={gpu_mem_gb():.2f}GB  reserved={gpu_reserved_gb():.2f}GB  "
+          f"CPU RAM={cpu_mem_gb():.2f}GB")
 
     results = {
         "mode": "partial",
         "model": model_name,
         "t_load_s": round(t_load, 2),
-        "gpu_mem_after_load_gb": round(gpu_mem_gb(), 3),
+        "gpu_allocated_after_load_gb": round(gpu_mem_gb(), 3),
+        "gpu_reserved_after_load_gb":  round(gpu_reserved_gb(), 3),
+        "cpu_mem_after_load_gb":       round(cpu_mem_gb(), 3),
         "stage1_chats": [],
         "stage1_to_2": {},
         "stage2_chats": [],
@@ -950,7 +1089,7 @@ def compare(path_a: str, path_b: str):
     label_a = f"{a['mode'].upper()} ({path_a})"
     label_b = f"{b['mode'].upper()} ({path_b})"
 
-    def fmt_row(label, va, vb, unit="s"):
+    def fmt_row(label, va, vb, unit="s", lower_is_better=True):
         """비교 행 포맷. None이면 N/A."""
         if va is None and vb is None:
             return f"  {label:<45}  {'N/A':>8}  {'N/A':>8}  {'':>12}"
@@ -958,13 +1097,17 @@ def compare(path_a: str, path_b: str):
         vb_s = f"{vb:.3f}{unit}" if vb is not None else "N/A"
         if va is not None and vb is not None and va > 0 and vb > 0:
             diff = vb - va
-            winner = "A" if va < vb else "B"
+            winner = ("A" if va < vb else "B") if lower_is_better else ("A" if va > vb else "B")
             pct = abs(diff) / max(va, vb) * 100
             arrow = "▼" if diff < 0 else "▲"
-            diff_s = f"{arrow}{abs(diff):.3f}s ({pct:.0f}%) [{winner}↑]"
+            diff_s = f"{arrow}{abs(diff):.3f}{unit} ({pct:.0f}%) [{winner}↑]"
         else:
             diff_s = ""
         return f"  {label:<45}  {va_s:>8}  {vb_s:>8}  {diff_s}"
+
+    def fmt_mem_row(label, va, vb):
+        """메모리 비교 행 포맷 (GB 단위, 낮을수록 좋음)."""
+        return fmt_row(label, va, vb, unit="GB", lower_is_better=True)
 
     W = 80
     print("\n" + "=" * W)
@@ -976,8 +1119,14 @@ def compare(path_a: str, path_b: str):
     print(f"  {'Metric':<45}  {'A':>8}  {'B':>8}  {'Delta (winner↑)':>20}")
     print(f"  {'-'*45}  {'-'*8}  {'-'*8}  {'-'*20}")
 
-    # ── 로드 시간 ──
+    # ── 로드 시간 + 메모리 ──
     print(fmt_row("Model load time", a["t_load_s"], b["t_load_s"]))
+    print(fmt_mem_row("  GPU allocated after load",
+                      a.get("gpu_allocated_after_load_gb"), b.get("gpu_allocated_after_load_gb")))
+    print(fmt_mem_row("  GPU reserved after load",
+                      a.get("gpu_reserved_after_load_gb"), b.get("gpu_reserved_after_load_gb")))
+    print(fmt_mem_row("  CPU RAM after load",
+                      a.get("cpu_mem_after_load_gb"), b.get("cpu_mem_after_load_gb")))
 
     # ── Stage 1 채팅 ──
     print(f"\n  {'── Stage 1 Chats ──':}")
@@ -1026,6 +1175,44 @@ def compare(path_a: str, path_b: str):
         print(fmt_row("  ★ t_total_effective [transition+first_chat]",
                       ta.get("t_total_effective_s"), tb.get("t_total_effective_s")))
 
+        # ── 메모리 상세 ──
+        print(f"\n  [Memory Detail]")
+        print(fmt_mem_row("  ckpt_size",
+                          ta.get("ckpt_size_gb"), tb.get("ckpt_size_gb")))
+        print(fmt_mem_row("  CPU RAM before transition",
+                          ta.get("cpu_mem_before_gb"), tb.get("cpu_mem_before_gb")))
+        print(fmt_mem_row("  CPU RAM after prefetch (ckpt on CPU)",
+                          ta.get("cpu_mem_after_prefetch_gb"), tb.get("cpu_mem_after_prefetch_gb")))
+        print(fmt_mem_row("  CPU RAM after transition",
+                          ta.get("cpu_mem_after_transition_gb"), tb.get("cpu_mem_after_transition_gb")))
+        print(fmt_mem_row("  GPU alloc before transition",
+                          ta.get("gpu_allocated_before_gb"), tb.get("gpu_allocated_before_gb")))
+        print(fmt_mem_row("  GPU alloc after activation",
+                          ta.get("gpu_allocated_after_activation_gb"),
+                          tb.get("gpu_allocated_after_activation_gb")))
+        print(fmt_mem_row("  GPU reserved after activation",
+                          ta.get("gpu_reserved_after_activation_gb"),
+                          tb.get("gpu_reserved_after_activation_gb")))
+        print(fmt_mem_row("  GPU peak alloc during activation",
+                          ta.get("gpu_peak_allocated_activation_gb"),
+                          tb.get("gpu_peak_allocated_activation_gb")))
+        # H2D 대역폭 (높을수록 좋음)
+        va_bw = ta.get("h2d_bandwidth_gb_s")
+        vb_bw = tb.get("h2d_bandwidth_gb_s")
+        print(fmt_row("  H2D bandwidth [ckpt/t_activation]",
+                      va_bw, vb_bw, unit="GB/s", lower_is_better=False))
+        # prefetch 중 CPU 활용률
+        pa = ta.get("prefetch_resources", {})
+        pb = tb.get("prefetch_resources", {})
+        print(fmt_mem_row("  CPU RAM peak during prefetch",
+                          pa.get("cpu_mem_peak_gb"), pb.get("cpu_mem_peak_gb")))
+        va_cpu = pa.get("cpu_pct_mean")
+        vb_cpu = pb.get("cpu_pct_mean")
+        if va_cpu is not None or vb_cpu is not None:
+            va_s = f"{va_cpu:.1f}%" if va_cpu is not None else "N/A"
+            vb_s = f"{vb_cpu:.1f}%" if vb_cpu is not None else "N/A"
+            print(f"  {'  CPU utilization mean during prefetch':<45}  {va_s:>8}  {vb_s:>8}")
+
     print_transition("Stage 1 → 2 Transition",
                      a.get("stage1_to_2", {}), b.get("stage1_to_2", {}))
 
@@ -1072,11 +1259,47 @@ def compare(path_a: str, path_b: str):
             print(f"  {label:<20}  {va:>9.2f}s  {vb:>9.2f}s  "
                   f"[{winner}] faster by {saving:.2f}s ({pct:.0f}%)")
 
+    # ── 메모리 요약 ──
+    print("\n" + "=" * W)
+    print("  ★ MEMORY SUMMARY (for paper table)")
+    print(f"  {'Metric':<45}  {'A':>10}  {'B':>10}")
+    print(f"  {'-'*45}  {'-'*10}  {'-'*10}")
+    for mem_label, key_a, key_b in [
+        ("GPU alloc after load",   "gpu_allocated_after_load_gb",  "gpu_allocated_after_load_gb"),
+        ("GPU reserved after load","gpu_reserved_after_load_gb",   "gpu_reserved_after_load_gb"),
+        ("CPU RAM after load",     "cpu_mem_after_load_gb",        "cpu_mem_after_load_gb"),
+    ]:
+        va = a.get(key_a)
+        vb = b.get(key_b)
+        va_s = f"{va:.3f} GB" if va is not None else "N/A"
+        vb_s = f"{vb:.3f} GB" if vb is not None else "N/A"
+        print(f"  {mem_label:<45}  {va_s:>10}  {vb_s:>10}")
+
+    for tr_label, tr_key in [("Stage 1→2", "stage1_to_2"), ("Stage 2→3", "stage2_to_3")]:
+        ta = a.get(tr_key, {})
+        tb = b.get(tr_key, {})
+        pa = ta.get("prefetch_resources", {})
+        pb = tb.get("prefetch_resources", {})
+        rows = [
+            ("CPU RAM peak (prefetch)",     pa.get("cpu_mem_peak_gb"),               pb.get("cpu_mem_peak_gb")),
+            ("CPU RAM after transition",    ta.get("cpu_mem_after_transition_gb"),   tb.get("cpu_mem_after_transition_gb")),
+            ("GPU alloc after activation",  ta.get("gpu_allocated_after_activation_gb"), tb.get("gpu_allocated_after_activation_gb")),
+            ("GPU reserved after activ.",   ta.get("gpu_reserved_after_activation_gb"),  tb.get("gpu_reserved_after_activation_gb")),
+            ("H2D bandwidth (GB/s)",        ta.get("h2d_bandwidth_gb_s"),            tb.get("h2d_bandwidth_gb_s")),
+        ]
+        print(f"\n  [{tr_label} Memory]")
+        for ml, va, vb in rows:
+            va_s = f"{va:.3f}" if va is not None else "N/A"
+            vb_s = f"{vb:.3f}" if vb is not None else "N/A"
+            print(f"  {ml:<45}  {va_s:>10}  {vb_s:>10}")
+
     print("\n  NOTE:")
     print("  - t_first_chat in Origin = FULL PREFILL (all tokens recomputed, slow)")
     print("  - t_first_chat in Partial = only new user tokens processed (fast, prefix cache hit)")
     print("  - t_skbi in Partial = Selective KV Block Injection (SKBI): upper layers only (~20ms)")
     print("    (lower layers KV untouched; prefix cache preserved → next generate skips prefill)")
+    print("  - CPU RAM peak during prefetch = staging buffer size (pinned, partial only)")
+    print("  - H2D bandwidth = ckpt_size_gb / t_activation_s")
     print("=" * W)
 
 

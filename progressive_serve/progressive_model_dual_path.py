@@ -565,24 +565,45 @@ class ProgressiveModelDualPath(nn.Module):
         KV-only forward: norm → qkv_proj → rotary → write_kv_to_cache
         Attention 연산(softmax + o_proj) 및 MLP 실행 안 함.
 
-        지원: Llama, Mistral, Qwen2, Gemma 등 self_attn 패턴 모델
+        지원: Llama/Mistral (self_attn + input_layernorm),
+              Falcon (self_attention + input_layernorm or ln_attn)
         """
+        # Falcon 감지: self_attention 속성 존재 (Llama 계열은 self_attn 사용)
+        # falcon-7b:  parallel_attn + input_layernorm (단일 LN)
+        # falcon-40b+: parallel_attn + ln_attn + ln_mlp (이중 LN)
+        is_falcon = hasattr(layer, 'self_attention') and not hasattr(layer, 'self_attn')
+
         # 1. Input layernorm
-        if hasattr(layer, 'input_layernorm'):
+        if is_falcon:
+            if hasattr(layer, 'ln_attn'):
+                normed = layer.ln_attn(hidden_states)
+            else:
+                # falcon-7b: input_layernorm (단일 LN, parallel attn에서 shared)
+                normed = layer.input_layernorm(hidden_states)
+        elif hasattr(layer, 'input_layernorm'):
             if residual is None:
                 normed = layer.input_layernorm(hidden_states)
             else:
-                normed, _ = layer.input_layernorm(hidden_states, residual)
+                try:
+                    normed, _ = layer.input_layernorm(hidden_states, residual)
+                except TypeError:
+                    normed = layer.input_layernorm(hidden_states)
         else:
             normed = hidden_states
 
-        # 2. QKV projection + rotary + cache write
-        attn = getattr(layer, 'self_attn', None)
+        # 2. Attention 모듈 선택
+        if is_falcon:
+            attn = layer.self_attention
+        else:
+            attn = getattr(layer, 'self_attn', None)
         if attn is None:
             return
 
-        # qkv_proj
-        qkv_proj = getattr(attn, 'qkv_proj', None)
+        # 3. QKV projection
+        if is_falcon:
+            qkv_proj = getattr(attn, 'query_key_value', None)
+        else:
+            qkv_proj = getattr(attn, 'qkv_proj', None)
         if qkv_proj is None:
             return
 

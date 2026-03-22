@@ -339,6 +339,29 @@ class ProgressiveForCausalLM(nn.Module):
                     loaded_keys.add(param_name)
                     loaded_count += 1
                     continue
+
+            # Option 5: Falcon HuggingFace 형식 변환
+            # vLLM param:    model.layers.N.layer.*   (ProgressiveModelDualPath 래핑)
+            # HF checkpoint: transformer.h.N.*         (Falcon 원본 형식)
+            if self.model_type == "falcon":
+                import re
+                falcon_name = re.sub(
+                    r'^model\.layers\.(\d+)\.layer\.',
+                    lambda m: f'transformer.h.{m.group(1)}.',
+                    param_name,
+                )
+                if falcon_name == param_name:
+                    # 레이어가 아닌 파라미터: embed_tokens, norm
+                    falcon_name = param_name \
+                        .replace("model.embed_tokens.", "transformer.word_embeddings.") \
+                        .replace("model.norm.", "transformer.ln_f.")
+                if falcon_name != param_name and falcon_name in checkpoint_weights:
+                    weight_loader = getattr(param, "weight_loader",
+                                           lambda p, w: p.data.copy_(w))
+                    weight_loader(param, checkpoint_weights[falcon_name])
+                    loaded_keys.add(param_name)
+                    loaded_count += 1
+                    continue
         
         # Missing weights 처리
         missing_keys = set(params_dict.keys()) - loaded_keys

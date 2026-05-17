@@ -60,15 +60,20 @@ from progressive_for_causal_lm import ProgressiveForCausalLM
 
 MODELS = {
     "llama": {
-        "progressive_path":   "/acpl-ssd30/7b_results/pruning/A",
-        "stage_b_checkpoint": "/acpl-ssd30/7b_results/pruning/checkpoints/stage2_layers_B.safetensors",
-        "stage_c_checkpoint": "/acpl-ssd30/7b_results/pruning/checkpoints/stage3_layers_C.safetensors",
+        "progressive_path":   "/acpl-ssd32/llama2-7b/base",
+        "stage_b_checkpoint": "/acpl-ssd32/llama2-7b/merged/kd-lora/checkpoints/stage2_layers_B_merged.safetensors",
+        "stage_c_checkpoint": "/acpl-ssd32/llama2-7b/merged/kd-lora/checkpoints/stage3_layers_C_merged.safetensors",
     },
-    "mistral": {
-        "progressive_path":   "/home/devewha/entropy_routing/25_mistral_results/pruning/A",
-        "stage_b_checkpoint": "/acpl-ssd30/25_mistral_results/pruning/bundles/stage2_layers_B.safetensors",
-        "stage_c_checkpoint": "/acpl-ssd30/25_mistral_results/pruning/bundles/stage3_layers_C.safetensors",
+    "falcon": {
+        "progressive_path": "/acpl-ssd32/falcon-7b/base",
+        "stage_b_checkpoint": "/acpl-ssd32/falcon-7b/merged/stage2_layers_B.safetensors",
+        "stage_c_checkpoint": "/acpl-ssd32/falcon-7b/merged/stage3_layers_C.safetensors",
     },
+    # "falcon": {
+    #     "progressive_path": "/acpl-ssd32/falcon-7b/pruned/A",
+    #     "stage_b_checkpoint": "/acpl-ssd32/falcon-7b/pruned/stage2_layers_B.safetensors",
+    #     "stage_c_checkpoint": "/acpl-ssd32/falcon-7b/pruned/stage3_layers_C.safetensors",
+    # },
 }
 
 

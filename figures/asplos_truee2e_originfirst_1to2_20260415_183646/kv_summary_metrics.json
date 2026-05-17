@@ -1,0 +1,14 @@
+[
+  {
+    "model": "falcon-7b",
+    "display_name": "Falcon-7B",
+    "repair_oracle_B": null,
+    "stale_oracle_B": null,
+    "repair_oracle_C": null,
+    "stale_oracle_C": null,
+    "repair_cost_tmax_us_per_token": 89.65,
+    "fast_path_success_pct": 100.0,
+    "post_promo_gain_tmax_x": 3.91,
+    "tmax": 1487
+  }
+]

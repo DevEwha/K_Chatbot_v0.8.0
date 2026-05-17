@@ -1,0 +1,379 @@
+{
+  "model": "llama2-7b",
+  "stage": "1to2",
+  "num_runs": 1,
+  "progressive_impl": "progressive_serve5",
+  "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+  "max_model_len": 2048,
+  "timestamp": "2026-04-06T15:22:15.314765",
+  "gpu_name": "NVIDIA RTX A6000",
+  "gpu_total_mem_gb": 47.43,
+  "t_load_s": 25.26,
+  "gpu_mem_gb": 18.631,
+  "cpu_mem_gb": 7.321,
+  "progressive_path": "/acpl-ssd32/llama2-7b/merged/kd-lora/A_merged",
+  "stage_b_checkpoint": "/acpl-ssd32/llama2-7b/merged/kd-lora/checkpoints/stage2_layers_B_merged.safetensors",
+  "stage_c_checkpoint": "/acpl-ssd32/llama2-7b/merged/kd-lora/checkpoints/stage3_layers_C_merged.safetensors",
+  "trust_remote_code": true,
+  "enable_prefix_caching": true,
+  "disable_sliding_window": false,
+  "gpu_memory_utilization_effective": 0.4,
+  "tensor_parallel_size_effective": 1,
+  "enforce_eager": false,
+  "t_constants": {
+    "t_prefetch_s": 1.691,
+    "t_activation_s": 0.468,
+    "t_cache_clear_s": 0.0004
+  },
+  "fixed_question": "Briefly summarize the key points discussed so far.",
+  "scaling": [
+    {
+      "target_T": 200,
+      "actual_T": 200,
+      "gpu_temp_c_start": 60,
+      "n_Q_tokens": 23,
+      "n_total_tokens": 223,
+      "t_sync_s": 0.0013,
+      "t_reconcile_s": 0.0571,
+      "t_skbi_s": 0.0571,
+      "skbi_ok": true,
+      "surgery_ok": true,
+      "reconcile_path": "surgery",
+      "reconcile_path_counts": {
+        "surgery": 1
+      },
+      "boundary": 21,
+      "surgery_profile": {
+        "success": true,
+        "reason": "ok",
+        "boundary": 21,
+        "seq_len": 201,
+        "num_blocks_needed": 13,
+        "available_blocks": 128,
+        "elapsed_ms": 49.696510657668114
+      },
+      "partial_recompute_profile": null,
+      "t_first_chat_partial_s": 0.0447,
+      "t_first_chat_origin_s": 0.0623,
+      "t_sync_stats": {
+        "mean": 0.0013,
+        "std": 0.0,
+        "median": 0.0013,
+        "min": 0.0013,
+        "max": 0.0013,
+        "n": 1
+      },
+      "t_reconcile_stats": {
+        "mean": 0.0571,
+        "std": 0.0,
+        "median": 0.0571,
+        "min": 0.0571,
+        "max": 0.0571,
+        "n": 1
+      },
+      "t_skbi_stats": {
+        "mean": 0.0571,
+        "std": 0.0,
+        "median": 0.0571,
+        "min": 0.0571,
+        "max": 0.0571,
+        "n": 1
+      },
+      "t_first_chat_partial_stats": {
+        "mean": 0.0447,
+        "std": 0.0,
+        "median": 0.0447,
+        "min": 0.0447,
+        "max": 0.0447,
+        "n": 1
+      },
+      "t_first_chat_origin_stats": {
+        "mean": 0.0623,
+        "std": 0.0,
+        "median": 0.0623,
+        "min": 0.0623,
+        "max": 0.0623,
+        "n": 1
+      },
+      "t_total_effective_partial_s": 2.262,
+      "t_total_effective_origin_s": 2.222,
+      "speedup_ratio": 1.39,
+      "ttft_savings_s": 0.0176,
+      "ttft_savings_pct": 28.3,
+      "t_reconcile_per_token_us": 285.5,
+      "t_skbi_per_token_us": 285.5,
+      "kv_cache_gb_mean": 0.102,
+      "kv_cache_gb_theoretical": 0.102,
+      "kv_cache_gb_stats": {
+        "mean": 0.0,
+        "std": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 1
+      },
+      "cpu_mem_gb": 7.32
+    },
+    {
+      "target_T": 500,
+      "actual_T": 500,
+      "gpu_temp_c_start": 61,
+      "n_Q_tokens": 23,
+      "n_total_tokens": 523,
+      "t_sync_s": 0.002,
+      "t_reconcile_s": 0.0253,
+      "t_skbi_s": 0.0253,
+      "skbi_ok": true,
+      "surgery_ok": true,
+      "reconcile_path": "surgery",
+      "reconcile_path_counts": {
+        "surgery": 1
+      },
+      "boundary": 21,
+      "surgery_profile": {
+        "success": true,
+        "reason": "ok",
+        "boundary": 21,
+        "seq_len": 501,
+        "num_blocks_needed": 32,
+        "available_blocks": 128,
+        "elapsed_ms": 6.883643567562103
+      },
+      "partial_recompute_profile": null,
+      "t_first_chat_partial_s": 0.0468,
+      "t_first_chat_origin_s": 0.1067,
+      "t_sync_stats": {
+        "mean": 0.002,
+        "std": 0.0,
+        "median": 0.002,
+        "min": 0.002,
+        "max": 0.002,
+        "n": 1
+      },
+      "t_reconcile_stats": {
+        "mean": 0.0253,
+        "std": 0.0,
+        "median": 0.0253,
+        "min": 0.0253,
+        "max": 0.0253,
+        "n": 1
+      },
+      "t_skbi_stats": {
+        "mean": 0.0253,
+        "std": 0.0,
+        "median": 0.0253,
+        "min": 0.0253,
+        "max": 0.0253,
+        "n": 1
+      },
+      "t_first_chat_partial_stats": {
+        "mean": 0.0468,
+        "std": 0.0,
+        "median": 0.0468,
+        "min": 0.0468,
+        "max": 0.0468,
+        "n": 1
+      },
+      "t_first_chat_origin_stats": {
+        "mean": 0.1067,
+        "std": 0.0,
+        "median": 0.1067,
+        "min": 0.1067,
+        "max": 0.1067,
+        "n": 1
+      },
+      "t_total_effective_partial_s": 2.233,
+      "t_total_effective_origin_s": 2.266,
+      "speedup_ratio": 2.28,
+      "ttft_savings_s": 0.0599,
+      "ttft_savings_pct": 56.1,
+      "t_reconcile_per_token_us": 50.6,
+      "t_skbi_per_token_us": 50.6,
+      "kv_cache_gb_mean": 0.25,
+      "kv_cache_gb_theoretical": 0.25,
+      "kv_cache_gb_stats": {
+        "mean": 0.0,
+        "std": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 1
+      },
+      "cpu_mem_gb": 7.32
+    },
+    {
+      "target_T": 1000,
+      "actual_T": 1000,
+      "gpu_temp_c_start": 61,
+      "n_Q_tokens": 23,
+      "n_total_tokens": 1023,
+      "t_sync_s": 0.0035,
+      "t_reconcile_s": 0.0459,
+      "t_skbi_s": 0.0459,
+      "skbi_ok": true,
+      "surgery_ok": true,
+      "reconcile_path": "surgery",
+      "reconcile_path_counts": {
+        "surgery": 1
+      },
+      "boundary": 21,
+      "surgery_profile": {
+        "success": true,
+        "reason": "ok",
+        "boundary": 21,
+        "seq_len": 1001,
+        "num_blocks_needed": 63,
+        "available_blocks": 128,
+        "elapsed_ms": 6.574256345629692
+      },
+      "partial_recompute_profile": null,
+      "t_first_chat_partial_s": 0.0471,
+      "t_first_chat_origin_s": 0.1634,
+      "t_sync_stats": {
+        "mean": 0.0035,
+        "std": 0.0,
+        "median": 0.0035,
+        "min": 0.0035,
+        "max": 0.0035,
+        "n": 1
+      },
+      "t_reconcile_stats": {
+        "mean": 0.0459,
+        "std": 0.0,
+        "median": 0.0459,
+        "min": 0.0459,
+        "max": 0.0459,
+        "n": 1
+      },
+      "t_skbi_stats": {
+        "mean": 0.0459,
+        "std": 0.0,
+        "median": 0.0459,
+        "min": 0.0459,
+        "max": 0.0459,
+        "n": 1
+      },
+      "t_first_chat_partial_stats": {
+        "mean": 0.0471,
+        "std": 0.0,
+        "median": 0.0471,
+        "min": 0.0471,
+        "max": 0.0471,
+        "n": 1
+      },
+      "t_first_chat_origin_stats": {
+        "mean": 0.1634,
+        "std": 0.0,
+        "median": 0.1634,
+        "min": 0.1634,
+        "max": 0.1634,
+        "n": 1
+      },
+      "t_total_effective_partial_s": 2.256,
+      "t_total_effective_origin_s": 2.323,
+      "speedup_ratio": 3.47,
+      "ttft_savings_s": 0.1163,
+      "ttft_savings_pct": 71.2,
+      "t_reconcile_per_token_us": 45.9,
+      "t_skbi_per_token_us": 45.9,
+      "kv_cache_gb_mean": 0.492,
+      "kv_cache_gb_theoretical": 0.492,
+      "kv_cache_gb_stats": {
+        "mean": 0.0,
+        "std": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 1
+      },
+      "cpu_mem_gb": 7.32
+    },
+    {
+      "target_T": 1500,
+      "actual_T": 1500,
+      "gpu_temp_c_start": 63,
+      "n_Q_tokens": 23,
+      "n_total_tokens": 1523,
+      "t_sync_s": 0.0067,
+      "t_reconcile_s": 0.0665,
+      "t_skbi_s": 0.0665,
+      "skbi_ok": true,
+      "surgery_ok": true,
+      "reconcile_path": "surgery",
+      "reconcile_path_counts": {
+        "surgery": 1
+      },
+      "boundary": 21,
+      "surgery_profile": {
+        "success": true,
+        "reason": "ok",
+        "boundary": 21,
+        "seq_len": 1501,
+        "num_blocks_needed": 94,
+        "available_blocks": 128,
+        "elapsed_ms": 7.323278114199638
+      },
+      "partial_recompute_profile": null,
+      "t_first_chat_partial_s": 0.0499,
+      "t_first_chat_origin_s": 0.2247,
+      "t_sync_stats": {
+        "mean": 0.0067,
+        "std": 0.0,
+        "median": 0.0067,
+        "min": 0.0067,
+        "max": 0.0067,
+        "n": 1
+      },
+      "t_reconcile_stats": {
+        "mean": 0.0665,
+        "std": 0.0,
+        "median": 0.0665,
+        "min": 0.0665,
+        "max": 0.0665,
+        "n": 1
+      },
+      "t_skbi_stats": {
+        "mean": 0.0665,
+        "std": 0.0,
+        "median": 0.0665,
+        "min": 0.0665,
+        "max": 0.0665,
+        "n": 1
+      },
+      "t_first_chat_partial_stats": {
+        "mean": 0.0499,
+        "std": 0.0,
+        "median": 0.0499,
+        "min": 0.0499,
+        "max": 0.0499,
+        "n": 1
+      },
+      "t_first_chat_origin_stats": {
+        "mean": 0.2247,
+        "std": 0.0,
+        "median": 0.2247,
+        "min": 0.2247,
+        "max": 0.2247,
+        "n": 1
+      },
+      "t_total_effective_partial_s": 2.282,
+      "t_total_effective_origin_s": 2.384,
+      "speedup_ratio": 4.5,
+      "ttft_savings_s": 0.1748,
+      "ttft_savings_pct": 77.8,
+      "t_reconcile_per_token_us": 44.33,
+      "t_skbi_per_token_us": 44.33,
+      "kv_cache_gb_mean": 0.734,
+      "kv_cache_gb_theoretical": 0.734,
+      "kv_cache_gb_stats": {
+        "mean": 0.0,
+        "std": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 1
+      },
+      "cpu_mem_gb": 7.321
+    }
+  ]
+}

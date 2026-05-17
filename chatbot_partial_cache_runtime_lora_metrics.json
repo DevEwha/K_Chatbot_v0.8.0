@@ -1,0 +1,89 @@
+{
+  "script": "chatbot_partial_cache_runtime_lora.py",
+  "model_name": "gemma7b",
+  "timestamp": "2026-04-06T08:30:44.663358",
+  "fixed_max_tokens": 50,
+  "throughput_requests": 3,
+  "transition_mode": "live",
+  "reconcile_mode": "auto",
+  "forward_variant": "dualpath_inplace",
+  "instant_streams": 4,
+  "alpha_update_mode": "inplace",
+  "enforce_eager": false,
+  "transition_window_samples": 64,
+  "consistency_probe_enabled": false,
+  "consistency_probe_max_tokens": 16,
+  "ttft_definition": {
+    "stage1_ttft_e2e": "cold_start_time + cold_first_request_to_first_token",
+    "stage1_ttft_steady_request_only": "post_warmup_request_to_first_token"
+  },
+  "t2ft_definition": "prefetch_wait_from_request + transition_time (instant_transition_time + runtime_lora_stage_policy_time) + cache_sync_time + cache_reconciliation_time + request_to_first_token",
+  "promotion_window_definition": {
+    "before_window": "last 64 request latencies before promotion",
+    "during_window": "overlap-serving latencies during prefetch plus transition first-token request",
+    "after_window": "post-promotion single-token latency samples"
+  },
+  "graph_event_counters": {
+    "cuda_graph_exception_count": 0,
+    "cuda_graph_recapture_hint_count": 0,
+    "instant_transition_fail_count": 0
+  },
+  "runtime_lora": {
+    "enabled": false,
+    "adapter_path": null,
+    "adapter_name": "stage12_runtime_lora",
+    "initial_adapter_path": null,
+    "initial_adapter_name": "stage12_runtime_lora",
+    "stage2_target_path": null,
+    "stage2_target_name": null,
+    "stage2_swapped": false,
+    "adapter_int_id": 1,
+    "max_lora_rank": 64,
+    "max_loras": 1,
+    "stage3_policy": "off",
+    "strict_mode": false,
+    "loaded": false,
+    "active_for_generation": false,
+    "events": []
+  },
+  "stages": {
+    "stage1": {
+      "cold_start_time": 189.36106753349304,
+      "active_layers": 21,
+      "inactive_layers": 7,
+      "activation_progress": "21/28",
+      "gpu_memory": {
+        "allocated_gb": 31.036842823028564,
+        "reserved_gb": 31.197265625,
+        "max_allocated_gb": 31.085670948028564
+      },
+      "runtime_lora": {
+        "enabled": false,
+        "adapter_path": null,
+        "adapter_name": "stage12_runtime_lora",
+        "initial_adapter_path": null,
+        "initial_adapter_name": "stage12_runtime_lora",
+        "stage2_target_path": null,
+        "stage2_target_name": null,
+        "stage2_swapped": false,
+        "adapter_int_id": 1,
+        "max_lora_rank": 64,
+        "max_loras": 1,
+        "stage3_policy": "off",
+        "strict_mode": false,
+        "loaded": false,
+        "active_for_generation": false,
+        "events": []
+      },
+      "inactive_layer_ratio": 0.25,
+      "executed_layer_equiv_est": 28.0,
+      "extra_layer_equiv_est": 7.0,
+      "gating_extra_flops_ratio_est": 0.3333333333333333,
+      "gating_extra_flops_pct_est": 33.33333333333333,
+      "gating_flops_reference": "skip_inactive_layers",
+      "gating_flops_estimation_note": "layer-equivalent proxy (not kernel-level FLOPs)"
+    }
+  },
+  "stage_transition_times": {},
+  "saved_at": "2026-04-06T08:33:55.508024"
+}

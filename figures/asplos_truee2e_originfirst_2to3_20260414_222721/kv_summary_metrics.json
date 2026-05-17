@@ -1,0 +1,14 @@
+[
+  {
+    "model": "llama2-13b",
+    "display_name": "LLaMA-2-13B",
+    "repair_oracle_B": null,
+    "stale_oracle_B": null,
+    "repair_oracle_C": null,
+    "stale_oracle_C": null,
+    "repair_cost_tmax_us_per_token": 109.04,
+    "fast_path_success_pct": 100.0,
+    "post_promo_gain_tmax_x": 4.67,
+    "tmax": 1500
+  }
+]

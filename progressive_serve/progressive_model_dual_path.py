@@ -1,10 +1,9 @@
 """
-Progressive Model Dual-Path (vLLM v0.8.0, v0 engine)
-
-모든 Decoder-only 모델 지원 (LLaMA, Mistral, Qwen, Phi, Gemma, GPT-2, Falcon 등)
-- 레이어는 항상 실행 (CUDA Graph topology 불변)
-- Path A (레이어 통과) + Path B (직접 연결) 둘 다 계산
-- Alpha로 어느 경로를 다음 레이어로 전달할지 선택
+vLLM v1(0.15.1)을 위한 코드 
+* 모든 Decoder-only 모델 지원(Llama, Mistral, QWen, Phi, Gemma, GPT-2, Falcon등)
+레이어 항상 실행해 topology 불변
+Path A(레이어 통과)+Path B(직접 연결) 둘 다 계산
+Alpha로 어느 경로를 다음 레이어로 전달할지 선택
 """
 
 
@@ -12,6 +11,8 @@ from typing import Optional, List, Dict, Any
 import importlib
 import threading
 import inspect
+from contextlib import contextmanager
+import copy
 import os
 import time
 import torch
@@ -36,6 +37,26 @@ from model_config import (
 # Universal bypass layer
 from universal_bypass_layer import UniversalBypassLayer 
 
+
+@contextmanager
+def _nvtx_range(name: str):
+    active = False
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(name)
+            active = True
+        except Exception:
+            active = False
+    try:
+        yield
+    finally:
+        if active:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+
+
 class ProgressiveModelDualPath(nn.Module):
     """
     Universal Progressive Model with Dual-Path Design
@@ -58,7 +79,6 @@ class ProgressiveModelDualPath(nn.Module):
     - Alpha로 어느 경로를 사용할지 선택:
       * alpha=1: Path A (레이어 통과)
       * alpha=0: Path B (직접 연결)
-      * 0<alpha<1: blend
 
     CUDA Graph 안전성:
     - 레이어 항상 실행 → kernel sequence 불변
@@ -101,6 +121,14 @@ class ProgressiveModelDualPath(nn.Module):
         self.layers = nn.ModuleList()
         self._init_layers(prefix)
         self._layer_forward_mode = self._resolve_layer_forward_mode()
+        self._forward_variant = os.environ.get("P2_FORWARD_VARIANT", "dualpath_inplace").strip().lower()
+        if self._forward_variant not in (
+            "dualpath_inplace",
+            "singlepath_branch",
+            "skip_inactive_layers",
+            "alpha_host_scalar",
+        ):
+            self._forward_variant = "dualpath_inplace"
 
         # Final norm
         self.norm = RMSNorm(
@@ -110,18 +138,13 @@ class ProgressiveModelDualPath(nn.Module):
 
         self.current_adapter = None
 
-        # ── Partial KV Recomputation (fallback) ──
-        # layer_idx → {"output": (hidden_states_gpu, residual_gpu)}
+        # ── Partial KV Recomputation ──
+        # layer_idx → {"output": (hidden_states_cpu, residual_cpu)}
         self._layer_output_cache: Dict[int, Any] = {}
         # None이면 일반 forward, 정수면 해당 layer부터 full forward
         self._partial_recompute_boundary: Optional[int] = None
         # 캐싱할 최대 레이어 인덱스 (다음 stage의 boundary-1)
         self._max_cacheable_layer: Optional[int] = None
-
-        # ── Selective KV Block Injection (SKBI) ──
-        # Decode 단계에서 저장: full sequence의 physical block mapping
-        self._skbi_block_tables: Optional[torch.Tensor] = None  # [1, max_blocks]
-        self._skbi_seq_lens_tensor: Optional[torch.Tensor] = None  # [1]
 
         # ── Persistent GPU Buffers (CUDA graph safe) ──
         # index_copy_는 in-place 연산 → CUDA graph에 캡처됨
@@ -131,8 +154,99 @@ class ProgressiveModelDualPath(nn.Module):
         self._persistent_r_buffers: List[torch.Tensor] = []
         self._persistent_buffers_initialized = False
 
+        # ── KV Block Surgery ──
+        # Decode 단계에서 저장: full sequence의 physical block mapping
+        self._surgery_block_tables: Optional[torch.Tensor] = None
+        self._surgery_seq_lens_tensor: Optional[torch.Tensor] = None
+
+        self._last_instant_activation_profile: Optional[Dict[str, Any]] = None
+        self._last_prefetch_profile: Optional[Dict[str, Any]] = None
+        self._last_surgery_profile: Optional[Dict[str, Any]] = None
+        self._last_partial_recompute_profile: Optional[Dict[str, Any]] = None
+        self._pin_prefetch_memory = (
+            torch.cuda.is_available()
+            and os.environ.get("PIN_PREFETCH_MEMORY", "1").lower() not in ("0", "false", "off")
+        )
+        self._enable_gpu_event_timing = (
+            torch.cuda.is_available()
+            and os.environ.get("ENABLE_GPU_EVENT_TIMING", "1").lower() not in ("0", "false", "off")
+        )
+
         print(f"✅ Initialized ProgressiveModelDualPath for: {self.model_type}")
         print(f"✅ Layer forward mode: {self._layer_forward_mode}")
+        print(f"✅ Forward variant: {self._forward_variant}")
+        print(f"✅ Prefetch pin_memory: {'ON' if self._pin_prefetch_memory else 'OFF'}")
+        print(f"✅ GPU event timing: {'ON' if self._enable_gpu_event_timing else 'OFF'}")
+
+    def _pin_state_dict_for_h2d(self, state_dict: Dict[str, Any]):
+        """
+        CPU tensor들을 pinned memory로 변환해 H2D non_blocking 복사를 실제 비동기로 만든다.
+        """
+        pinned_state = {}
+        pinned_count = 0
+        already_pinned_count = 0
+        failed_count = 0
+        skipped_non_tensor_count = 0
+        pinned_bytes = 0
+
+        t0 = time.perf_counter()
+        for name, tensor in state_dict.items():
+            if not torch.is_tensor(tensor):
+                pinned_state[name] = tensor
+                skipped_non_tensor_count += 1
+                continue
+            if tensor.device.type != "cpu":
+                pinned_state[name] = tensor
+                continue
+            if tensor.is_pinned():
+                pinned_state[name] = tensor
+                already_pinned_count += 1
+                continue
+            try:
+                pinned = tensor.pin_memory()
+                pinned_state[name] = pinned
+                pinned_count += 1
+                pinned_bytes += pinned.numel() * pinned.element_size()
+            except Exception:
+                pinned_state[name] = tensor
+                failed_count += 1
+        elapsed_s = time.perf_counter() - t0
+
+        profile = {
+            "enabled": True,
+            "pin_time_s": elapsed_s,
+            "pinned_count": pinned_count,
+            "already_pinned_count": already_pinned_count,
+            "failed_count": failed_count,
+            "skipped_non_tensor_count": skipped_non_tensor_count,
+            "pinned_bytes": pinned_bytes,
+            "pinned_mb": pinned_bytes / (1024 ** 2),
+        }
+        return pinned_state, profile
+
+    def _timed_cuda_op(self, fn, device: torch.device):
+        """
+        CPU wall time + (가능하면) CUDA event 기반 GPU 실행 시간을 함께 측정한다.
+        """
+        cpu_t0 = time.perf_counter()
+        if self._enable_gpu_event_timing and device.type == "cuda":
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            out = fn()
+            end_evt.record()
+            cpu_s = time.perf_counter() - cpu_t0
+            gpu_s = 0.0
+            try:
+                end_evt.synchronize()
+                gpu_s = start_evt.elapsed_time(end_evt) / 1000.0
+            except Exception:
+                gpu_s = 0.0
+            return out, cpu_s, gpu_s
+
+        out = fn()
+        cpu_s = time.perf_counter() - cpu_t0
+        return out, cpu_s, 0.0
     
     def _get_layer_class(self, model_type: str):
         """
@@ -185,7 +299,8 @@ class ProgressiveModelDualPath(nn.Module):
             if layer_idx in self.initially_inactive:
                 print(f"[Init] Layer {layer_idx:2d}: DualPath (alpha=0, Path B)")
                 
-                # 아직 로드되지 않은 레이어 가중치를 0으로 초기화
+                # Weight를 0으로 초기화
+                # alpha=0일 때 Path A는 zero-output이므로 GPU 최적화됨
                 self._initialize_weights_to_zero(base_layer)
                 
                 wrapped = UniversalBypassLayer(
@@ -321,16 +436,13 @@ class ProgressiveModelDualPath(nn.Module):
         mem_mb = num_layers * max_seq_len * hidden_dim * 2 * 2 / (1024**2)
         print(f"✅ Persistent GPU buffers: {num_layers} layers × {max_seq_len} seq = {mem_mb:.0f} MB")
 
-    # ----------------------------------------------------------------
-    # Persistent Buffer → GPU Cache 동기화 (CPU 전송 제거)
-    # ----------------------------------------------------------------
     def sync_persistent_cache(self, seq_len: int):
         """
-        GPU persistent buffer의 현재 상태를 _layer_output_cache에 스냅샷.
+        GPU persistent buffer → GPU _layer_output_cache
 
-        Stage 전환 직전에 호출. GPU 내에서 clone()으로 복사 (D2H 전송 없음).
-        clone()은 partial recompute 도중 버퍼에 in-place 기록이 발생하여
-        참조가 꼬이는 것을 방지하기 위함.
+        Stage 전환 직전에 chatbot에서 호출.
+        GPU buffer의 [0:seq_len] 구간을 GPU-to-GPU clone하여 partial recompute에 사용.
+        .cpu() 대신 .clone() 사용 → PCIe D2H 병목 제거 (<1ms, VRAM-to-VRAM 복사)
         """
         if not self._persistent_buffers_initialized:
             print(f"[Cache] ⚠️ Persistent buffers not initialized")
@@ -344,7 +456,7 @@ class ProgressiveModelDualPath(nn.Module):
             r = self._persistent_r_buffers[layer_idx][:seq_len].clone()
             self._layer_output_cache[layer_idx] = {"output": (h, r)}
 
-        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU-only)")
+        print(f"[Cache] Synced {max_layer + 1} layers × {seq_len} tokens (GPU → GPU clone)")
 
     def clear_persistent_buffers(self):
         """Persistent buffer 초기화 (warmup 데이터 제거)"""
@@ -385,10 +497,13 @@ class ProgressiveModelDualPath(nn.Module):
         - All operations on GPU tensors
         """
 
-        # SKBI: decode step마다 block_tables를 view로 저장.
-        # view를 사용하는 이유: CUDA graph replay 시 prepare_graph_input_buffers()가
-        # 원본 텐서를 in-place 업데이트하면 view도 자동으로 최신 값을 반영.
-        # clone()을 사용하면 graph 캡처 시점의 dummy 값이 고정되어 버그 발생.
+        # ── Surgery: block_tables 추적 ──
+        # CUDA graph 호환: clone() 대신 view 저장
+        #   - CUDA graph 캡처 시: Python forward() 실행 → view 저장
+        #   - CUDA graph replay 시: prepare_graph_input_buffers()가 원본 텐서 in-place 업데이트
+        #     → view가 자동으로 최신 값 반영 (라이브 포인터)
+        #   - Eager 모드 시: 매 step마다 forward() 실행 → view 갱신
+        # 주의: clone() 사용 시 CUDA graph 캡처 시점의 dummy 값이 고정됨 → 버그!
         try:
             from vllm.forward_context import get_forward_context as _get_fwd_ctx
             _fwd_meta = _get_fwd_ctx().attn_metadata
@@ -398,8 +513,10 @@ class ProgressiveModelDualPath(nn.Module):
                     and _fwd_meta.block_tables.numel() > 0
                     and getattr(_fwd_meta, 'seq_lens_tensor', None) is not None
                     and _fwd_meta.seq_lens_tensor.numel() > 0):
-                self._skbi_block_tables = _fwd_meta.block_tables[:1]
-                self._skbi_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
+                # view (not clone): 원본 텐서와 동일한 메모리 공유
+                # → CUDA graph replay 전 prepare_graph_input_buffers()가 원본 업데이트 시 자동 반영
+                self._surgery_block_tables = _fwd_meta.block_tables[:1]
+                self._surgery_seq_lens_tensor = _fwd_meta.seq_lens_tensor[:1]
         except Exception:
             pass
 
@@ -419,7 +536,23 @@ class ProgressiveModelDualPath(nn.Module):
             and self._is_cache_compatible(hidden_states)
         )
 
+        if boundary is None:
+            self._last_partial_recompute_profile = None
+        elif not use_partial:
+            self._last_partial_recompute_profile = {
+                "used": False,
+                "reason": "cache_unavailable_or_incompatible",
+                "boundary": int(boundary),
+                "kv_only_count": 0,
+                "full_forward_count": 0,
+                "optimized_ratio": 0.0,
+                "total_layers": len(self.layers),
+                "elapsed_s": 0.0,
+            }
+
+        # 디버그: Partial recompute 시작
         if use_partial:
+            partial_t0 = time.perf_counter()
             print(f"\n[PartialRecompute] 🚀 Starting partial KV recomputation")
             print(f"  Boundary: {boundary}")
             print(f"  Cached layers: {len(self._layer_output_cache)}")
@@ -459,14 +592,22 @@ class ProgressiveModelDualPath(nn.Module):
                     hidden_states = cached["output"][0].to(hidden_states.device)
                     residual = cached["output"][1].to(hidden_states.device) if cached["output"][1] is not None else None
 
+                    # 디버그: KV-only 카운트
                     if layer_idx == 0 or layer_idx % 5 == 0 or layer_idx == boundary - 1:
                         print(f"  Layer {layer_idx:2d}: ✓ KV-only (cached)")
                     kv_only_count += 1
                     continue
 
-            # ── Normal dual-path forward ──
-            # Alpha 값 (tensor, CUDA Graph safe!)
-            alpha = layer_wrapper.get_alpha()  # ← Returns tensor!
+            # ── Normal forward / variant ablation path ──
+            # naive ablation variants intentionally violate graph-safe invariants.
+            if self._forward_variant in ("singlepath_branch", "skip_inactive_layers") and (not layer_wrapper.is_active()):
+                # inactive layer를 구조적으로 우회(naive)한다.
+                if self._max_cacheable_layer is None or layer_idx <= self._max_cacheable_layer:
+                    self._init_persistent_buffers(hidden_states.device, hidden_states.dtype)
+                    self._persistent_h_buffers[layer_idx].index_copy_(0, positions, hidden_states)
+                    if residual is not None:
+                        self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
+                continue
 
             # Path A: Layer 통과
             hidden_a, residual_a = self._call_layer_forward_fast(
@@ -476,21 +617,36 @@ class ProgressiveModelDualPath(nn.Module):
                 residual=residual,
             )
 
-            # Path B: 레이어 간 직접 연결 (bypass)
-            hidden_b = hidden_states  # 이전 값 그대로
-            residual_b = residual if residual is not None else None
-
-            # Alpha로 경로 선택
-            # Hidden states blending (tensor operations, CUDA Graph safe!)
-            hidden_states = alpha * hidden_a + (1.0 - alpha) * hidden_b
-
-            # Residual blending
-            if residual_a is not None and residual_b is not None:
-                residual = alpha * residual_a + (1.0 - alpha) * residual_b
-            elif residual_a is not None:
-                residual = alpha * residual_a
+            if self._forward_variant == "singlepath_branch":
+                hidden_states = hidden_a
+                if residual_a is not None:
+                    residual = residual_a
             else:
-                residual = residual_b
+                # Path B: 레이어 간 직접 연결 (bypass)
+                hidden_b = hidden_states  # 이전 값 그대로
+                residual_b = residual if residual is not None else None
+
+                if self._forward_variant == "alpha_host_scalar":
+                    # CUDA graph safety invariant를 의도적으로 깨는 naive variant.
+                    alpha = layer_wrapper.get_alpha_value()
+                    hidden_states = alpha * hidden_a + (1.0 - alpha) * hidden_b
+                    if residual_a is not None and residual_b is not None:
+                        residual = alpha * residual_a + (1.0 - alpha) * residual_b
+                    elif residual_a is not None:
+                        residual = alpha * residual_a
+                    else:
+                        residual = residual_b
+                else:
+                    # Default: tensor-only routing (CUDA graph safe)
+                    alpha = layer_wrapper.get_alpha()
+                    hidden_states = torch.lerp(hidden_b, hidden_a, alpha)
+
+                    if residual_a is not None and residual_b is not None:
+                        residual = torch.lerp(residual_b, residual_a, alpha)
+                    elif residual_a is not None:
+                        residual = alpha * residual_a
+                    else:
+                        residual = residual_b
 
             # ── Persistent GPU buffer에 hidden states 기록 ──
             # index_copy_()는 in-place 연산 → CUDA graph에 캡처됨
@@ -501,17 +657,29 @@ class ProgressiveModelDualPath(nn.Module):
                 if residual is not None:
                     self._persistent_r_buffers[layer_idx].index_copy_(0, positions, residual)
 
+            # 디버그: Full forward 카운트
             if use_partial and layer_idx >= boundary:
                 if layer_idx == boundary or layer_idx % 5 == 0 or layer_idx == len(self.layers) - 1:
                     print(f"  Layer {layer_idx:2d}: ↻ Full forward (recompute)")
                 full_forward_count += 1
 
+        # 디버그: Partial recompute 완료 통계
         if use_partial:
             print(f"\n[PartialRecompute] ✅ Completed")
             print(f"  KV-only:      {kv_only_count} layers (skipped attention+MLP)")
             print(f"  Full forward: {full_forward_count} layers (recomputed)")
             savings = (kv_only_count / len(self.layers)) * 100
             print(f"  Savings:      ~{savings:.1f}% of layers optimized\n")
+            self._last_partial_recompute_profile = {
+                "used": True,
+                "reason": "ok",
+                "boundary": int(boundary),
+                "kv_only_count": kv_only_count,
+                "full_forward_count": full_forward_count,
+                "optimized_ratio": savings / 100.0,
+                "total_layers": len(self.layers),
+                "elapsed_s": time.perf_counter() - partial_t0,
+            }
 
         # Partial recompute는 1회성 (성공 여부 무관, 다음 forward부터 일반 모드)
         if boundary is not None:
@@ -636,12 +804,32 @@ class ProgressiveModelDualPath(nn.Module):
             print(f"[PartialRecompute] Invalid boundary {boundary_layer_idx}, "
                   f"falling back to full recompute")
             self._partial_recompute_boundary = None
+            self._last_partial_recompute_profile = {
+                "used": False,
+                "reason": "invalid_boundary",
+                "boundary": int(boundary_layer_idx),
+                "kv_only_count": 0,
+                "full_forward_count": 0,
+                "optimized_ratio": 0.0,
+                "total_layers": len(self.layers),
+                "elapsed_s": 0.0,
+            }
             return
 
         if len(self._layer_output_cache) == 0:
             print(f"[PartialRecompute] No cached hidden states, "
                   f"falling back to full recompute")
             self._partial_recompute_boundary = None
+            self._last_partial_recompute_profile = {
+                "used": False,
+                "reason": "no_cached_hidden_states",
+                "boundary": int(boundary_layer_idx),
+                "kv_only_count": 0,
+                "full_forward_count": 0,
+                "optimized_ratio": 0.0,
+                "total_layers": len(self.layers),
+                "elapsed_s": 0.0,
+            }
             return
 
         self._partial_recompute_boundary = boundary_layer_idx
@@ -653,18 +841,19 @@ class ProgressiveModelDualPath(nn.Module):
         """Hidden state 캐시 초기화"""
         self._layer_output_cache.clear()
         self._partial_recompute_boundary = None
+        self._last_partial_recompute_profile = None
 
     # ================================================================
-    # Selective KV Block Injection (SKBI)
+    # KV Block Surgery
     # ================================================================
 
-    def apply_skbi(
+    def inject_upper_layer_kv(
         self,
         boundary: int,
         seq_len: Optional[int] = None,
     ) -> bool:
         """
-        Stage 전환 시 upper layer KV만 업데이트하는 Selective KV Block Injection (SKBI).
+        Stage 전환 시 upper layer KV만 업데이트하는 KV block surgery.
 
         원리:
         - Lower layers (0..boundary-1): 가중치 동일 → KV 불변 → 손대지 않음
@@ -673,42 +862,62 @@ class ProgressiveModelDualPath(nn.Module):
         - 결과: 다음 generate()에서 prefill 완전 스킵
 
         Returns:
-            True: SKBI 성공
+            True: surgery 성공
             False: 실패 (호출자가 reset_prefix_cache + partial recompute로 fallback)
         """
-        if not self._persistent_buffers_initialized:
-            print("[SKBI] ❌ Persistent buffers not initialized")
-            return False
+        call_t0 = time.perf_counter()
+        num_blocks_needed: Optional[int] = None
+        available_blocks: Optional[int] = (
+            int(self._surgery_block_tables.shape[1])
+            if self._surgery_block_tables is not None
+            else None
+        )
 
-        if self._skbi_block_tables is None:
-            print("[SKBI] ❌ No block tables saved (no decode step happened yet)")
-            return False
+        def _finish(success: bool, reason: str) -> bool:
+            self._last_surgery_profile = {
+                "success": bool(success),
+                "reason": reason,
+                "boundary": int(boundary) if boundary is not None else None,
+                "seq_len": int(seq_len) if seq_len is not None else None,
+                "num_blocks_needed": int(num_blocks_needed) if num_blocks_needed is not None else None,
+                "available_blocks": available_blocks,
+                "elapsed_ms": (time.perf_counter() - call_t0) * 1000.0,
+            }
+            return success
+
+        if not self._persistent_buffers_initialized:
+            print("[Surgery] ❌ Persistent buffers not initialized")
+            return _finish(False, "persistent_buffers_not_initialized")
+
+        if self._surgery_block_tables is None:
+            print("[Surgery] ❌ No block tables saved (no decode step happened yet)")
+            return _finish(False, "missing_block_tables")
 
         # seq_len 결정
         if seq_len is None:
-            if self._skbi_seq_lens_tensor is None:
-                print("[SKBI] ❌ No seq_lens_tensor saved")
-                return False
-            seq_len = int(self._skbi_seq_lens_tensor[0].item())
+            if self._surgery_seq_lens_tensor is None:
+                print("[Surgery] ❌ No seq_lens_tensor saved")
+                return _finish(False, "missing_seq_lens_tensor")
+            seq_len = int(self._surgery_seq_lens_tensor[0].item())
 
         if seq_len < 1:
-            print(f"[SKBI] ❌ Invalid seq_len={seq_len}")
-            return False
+            print(f"[Surgery] ❌ Invalid seq_len={seq_len}")
+            return _finish(False, "invalid_seq_len")
 
         if boundary <= 0 or boundary >= len(self.layers):
-            print(f"[SKBI] ❌ Invalid boundary {boundary} for {len(self.layers)} layers")
-            return False
+            print(f"[Surgery] ❌ Invalid boundary {boundary} for {len(self.layers)} layers")
+            return _finish(False, "invalid_boundary")
 
         device = self._persistent_h_buffers[0].device
         block_size = self.vllm_config.cache_config.block_size
         num_blocks_needed = (seq_len + block_size - 1) // block_size
 
-        if self._skbi_block_tables.shape[1] < num_blocks_needed:
-            print(f"[SKBI] ❌ Not enough blocks: have {self._skbi_block_tables.shape[1]}, "
+        if self._surgery_block_tables.shape[1] < num_blocks_needed:
+            print(f"[Surgery] ❌ Not enough blocks: have {self._surgery_block_tables.shape[1]}, "
                   f"need {num_blocks_needed} for seq_len={seq_len}")
-            return False
+            return _finish(False, "insufficient_blocks")
 
-        print(f"\n[SKBI] 🔪 Selective KV Block Injection (SKBI) starting")
+        print(f"\n[Surgery] 🔪 KV block surgery starting")
         print(f"  Lower layers 0~{boundary-1}: KV 보존 (가중치 동일, 연산 없음)")
         print(f"  Upper layers {boundary}~{len(self.layers)-1}: 새 가중치로 KV 재계산")
         print(f"  Seq len: {seq_len} tokens | Blocks: {num_blocks_needed}")
@@ -716,12 +925,12 @@ class ProgressiveModelDualPath(nn.Module):
         # block_tables에서 slot_mapping 재구성
         try:
             slot_mapping = self._reconstruct_slot_mapping(
-                self._skbi_block_tables[:1, :num_blocks_needed],
+                self._surgery_block_tables[:1, :num_blocks_needed],
                 seq_len, block_size, device,
             )
         except Exception as e:
-            print(f"[SKBI] ❌ slot_mapping 재구성 실패: {e}")
-            return False
+            print(f"[Surgery] ❌ slot_mapping 재구성 실패: {e}")
+            return _finish(False, f"slot_mapping_reconstruct_failed: {e}")
 
         # boundary-1 레이어의 출력 = boundary 레이어의 입력
         h = self._persistent_h_buffers[boundary - 1][:seq_len].clone()
@@ -729,13 +938,13 @@ class ProgressiveModelDualPath(nn.Module):
 
         positions = torch.arange(seq_len, device=device, dtype=torch.long)
 
-        # SKBI용 FlashAttentionMetadata 구성
+        # Surgery용 FlashAttentionMetadata 구성
         # context_lens_tensor=zeros → 전체 seq_len 토큰을 fresh prefill로 처리
         # → K,V cache write + full causal attention 계산
         try:
             from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 
-            skbi_meta = FlashAttentionMetadata(
+            surgery_meta = FlashAttentionMetadata(
                 num_prefills=1,
                 num_prefill_tokens=seq_len,
                 num_decode_tokens=0,
@@ -749,7 +958,7 @@ class ProgressiveModelDualPath(nn.Module):
                 max_decode_seq_len=0,
                 context_lens_tensor=torch.zeros(
                     1, dtype=torch.int32, device=device),
-                block_tables=self._skbi_block_tables[:1, :num_blocks_needed],
+                block_tables=self._surgery_block_tables[:1, :num_blocks_needed],
                 use_cuda_graph=False,
                 max_query_len=seq_len,
                 query_start_loc=torch.tensor(
@@ -759,18 +968,18 @@ class ProgressiveModelDualPath(nn.Module):
                 max_decode_query_len=0,
             )
         except Exception as e:
-            print(f"[SKBI] ❌ Metadata 생성 실패: {e}")
+            print(f"[Surgery] ❌ Metadata 생성 실패: {e}")
             import traceback
             traceback.print_exc()
-            return False
+            return _finish(False, f"metadata_build_failed: {e}")
 
-        # Upper layers를 SKBI ForwardContext 안에서 직접 실행
+        # Upper layers를 surgery ForwardContext 안에서 직접 실행
         t0 = time.perf_counter()
         try:
             from vllm.forward_context import set_forward_context
             with torch.inference_mode():
                 with set_forward_context(
-                    skbi_meta, self.vllm_config, virtual_engine=0
+                    surgery_meta, self.vllm_config, virtual_engine=0
                 ):
                     for layer_idx in range(boundary, len(self.layers)):
                         layer_wrapper = self.layers[layer_idx]
@@ -796,20 +1005,37 @@ class ProgressiveModelDualPath(nn.Module):
                         else:
                             r = residual_b
 
+                        # Keep persistent hidden-state buffers in sync so that
+                        # subsequent stage transitions read fresh boundary-1 inputs.
+                        if self._max_cacheable_layer is None or layer_idx <= self._max_cacheable_layer:
+                            self._persistent_h_buffers[layer_idx].index_copy_(0, positions, h)
+                            if r is not None:
+                                self._persistent_r_buffers[layer_idx].index_copy_(0, positions, r)
+
         except Exception as e:
-            print(f"[SKBI] ❌ SKBI forward 실패: {e}")
+            print(f"[Surgery] ❌ Surgery forward 실패: {e}")
             import traceback
             traceback.print_exc()
-            return False
+            return _finish(False, f"surgery_forward_failed: {e}")
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        print(f"  ✅ SKBI 완료 ({elapsed_ms:.1f} ms)")
+        print(f"  ✅ KV surgery 완료 ({elapsed_ms:.1f} ms)")
         print(f"  📌 Lower (0~{boundary-1}): KV 그대로 (재계산 없음)")
         print(f"  📌 Upper ({boundary}~{len(self.layers)-1}): KV 업데이트됨")
         print(f"  📌 Prefix cache 유지 → 다음 generate()에서 prefill 스킵\n")
 
-        return True
+        return _finish(True, "ok")
+
+    def get_last_surgery_profile(self) -> Optional[Dict[str, Any]]:
+        if self._last_surgery_profile is None:
+            return None
+        return copy.deepcopy(self._last_surgery_profile)
+
+    def get_last_partial_recompute_profile(self) -> Optional[Dict[str, Any]]:
+        if self._last_partial_recompute_profile is None:
+            return None
+        return copy.deepcopy(self._last_partial_recompute_profile)
 
     def _reconstruct_slot_mapping(
         self,
@@ -880,7 +1106,8 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Checkpoint 로드
         print(f"Loading checkpoint from: {checkpoint_path}")
-        state_dict = load_file(checkpoint_path)
+        with _nvtx_range("p2_activate_load_file_checkpoint"):
+            state_dict = load_file(checkpoint_path)
         
         device = next(self.parameters()).device
         
@@ -900,42 +1127,43 @@ class ProgressiveModelDualPath(nn.Module):
             # 1. Weight 추출
             print(f"  🔥 Loading weights...")
             layer_prefix = f"model.layers.{layer_idx}."
-            layer_weights = {
-                k.replace(layer_prefix, ""): v
-                for k, v in state_dict.items()
-                if k.startswith(layer_prefix)
-            }
+            with _nvtx_range("p2_activate_extract_layer_weights"):
+                layer_weights = {
+                    k.replace(layer_prefix, ""): v
+                    for k, v in state_dict.items()
+                    if k.startswith(layer_prefix)
+                }
             
             if not layer_weights:
                 print(f"  ⚠️  No weights found for layer {layer_idx}")
                 continue
             
             # 2. In-place weight 로드 (범용, CUDA Graph 호환!)
-            loaded_count = self._load_layer_weights(
-                layer_wrapper.layer,
-                layer_weights,
-                weight_pattern,
-                device,
-            )
+            with _nvtx_range("p2_activate_load_layer_weights"):
+                loaded_count = self._load_layer_weights(
+                    layer_wrapper.layer,
+                    layer_weights,
+                    weight_pattern,
+                    device,
+                )
             
             print(f"  ✅ Loaded {loaded_count} weight tensors")
             
             # 3. Alpha 활성화 (0 → 1)
-            layer_wrapper.activate()
+            with _nvtx_range("p2_activate_alpha_flip"):
+                layer_wrapper.activate()
             
             # 4. initially_inactive에서 제거
             self.initially_inactive.discard(layer_idx)
             
             print(f"  ✅ Layer {layer_idx} activated!")
         
-        # non_blocking=True copy가 모두 GPU에서 완료될 때까지 대기
-        torch.cuda.synchronize()
         print(f"\n{'='*60}")
         print(f"LAYER ACTIVATION COMPLETE")
         print(f"Inactive layers: {self.count_inactive_layers()}")
         print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음")
         print(f"{'='*60}\n")
-
+    
     def prefetch_weights(self, checkpoint_path: str, layer_indices: List[int]) -> None:
         """
         백그라운드 스레드에서 checkpoint를 CPU 메모리에 미리 로드.
@@ -960,6 +1188,7 @@ class ProgressiveModelDualPath(nn.Module):
             self._prefetch_event.wait()
 
         self._prefetch_buffer = None
+        self._last_prefetch_profile = None
         self._prefetch_indices = list(layer_indices)
         self._prefetch_path = checkpoint_path
         self._prefetch_event = threading.Event()
@@ -967,9 +1196,34 @@ class ProgressiveModelDualPath(nn.Module):
         def _worker():
             try:
                 print(f"[Prefetch] Loading {checkpoint_path} in background...")
-                state_dict = load_file(checkpoint_path)
-                self._prefetch_buffer = state_dict
+                with _nvtx_range("p2_prefetch_worker"):
+                    load_t0 = time.perf_counter()
+                    with _nvtx_range("p2_prefetch_load_file"):
+                        state_dict = load_file(checkpoint_path)
+                    load_file_s = time.perf_counter() - load_t0
+
+                    pin_profile = {"enabled": False}
+                    if self._pin_prefetch_memory:
+                        with _nvtx_range("p2_prefetch_pin_memory"):
+                            state_dict, pin_profile = self._pin_state_dict_for_h2d(state_dict)
+
+                    with _nvtx_range("p2_prefetch_store_buffer"):
+                        self._prefetch_buffer = state_dict
+                self._last_prefetch_profile = {
+                    "path": checkpoint_path,
+                    "tensor_count": len(state_dict),
+                    "load_file_s": load_file_s,
+                    "pin_memory": pin_profile,
+                }
                 print(f"[Prefetch] ✅ {len(state_dict)} tensors ready in CPU memory")
+                if pin_profile.get("enabled"):
+                    print(
+                        "[Prefetch] pin_memory: "
+                        f"{pin_profile['pinned_count']} tensors, "
+                        f"{pin_profile['pinned_mb']:.1f} MB, "
+                        f"{pin_profile['pin_time_s']:.3f}s "
+                        f"(already={pin_profile['already_pinned_count']}, failed={pin_profile['failed_count']})"
+                    )
             except Exception as e:
                 print(f"[Prefetch] ❌ Failed: {e}")
                 self._prefetch_buffer = None
@@ -983,6 +1237,7 @@ class ProgressiveModelDualPath(nn.Module):
         self,
         layer_indices: List[int],
         wait_if_needed: bool = True,
+        num_streams: int = 4,
     ) -> bool:
         """
         prefetch_weights()로 CPU에 올려둔 버퍼에서 즉각 활성화.
@@ -1012,46 +1267,190 @@ class ProgressiveModelDualPath(nn.Module):
                 f"Layer indices mismatch: prefetch={self._prefetch_indices}, "
                 f"requested={layer_indices}"
             )
+        if num_streams < 1:
+            raise ValueError(f"num_streams must be >= 1, got {num_streams}")
 
         state_dict = self._prefetch_buffer
         device = next(self.parameters()).device
         weight_pattern = get_weight_pattern(self.model_type)
+        use_cuda_streams = (
+            device.type == "cuda" and torch.cuda.is_available() and num_streams > 1
+        )
+        streams = (
+            [torch.cuda.Stream(device=device) for _ in range(num_streams)]
+            if use_cuda_streams
+            else []
+        )
 
-        print(f"\n{'='*60}")
-        print(f"INSTANT ACTIVATION: {layer_indices}")
-        print(f"{'='*60}")
-
-        try:
+        # 레이어별 weights를 먼저 추출해 Python-side 오버헤드를 줄임
+        extract_t0 = time.perf_counter()
+        with _nvtx_range("p2_instant_extract_layers_data"):
+            layers_data = []
             for layer_idx in layer_indices:
-                layer_wrapper = self.layers[layer_idx]
-
-                if layer_wrapper.is_active():
-                    print(f"  Layer {layer_idx}: already active")
-                    continue
-
                 layer_prefix = f"model.layers.{layer_idx}."
                 layer_weights = {
                     k.replace(layer_prefix, ""): v
                     for k, v in state_dict.items()
                     if k.startswith(layer_prefix)
                 }
+                layers_data.append((layer_idx, layer_weights))
+        extract_layers_data_s = time.perf_counter() - extract_t0
+
+        print(f"\n{'='*60}")
+        print(f"INSTANT ACTIVATION: {layer_indices}")
+        print(f"{'='*60}")
+
+        profile: Dict[str, Any] = {
+            "timestamp": time.time(),
+            "layer_indices": list(layer_indices),
+            "num_streams": num_streams,
+            "use_cuda_streams": use_cuda_streams,
+            "extract_layers_data_s": extract_layers_data_s,
+            "apply_schedule_s": 0.0,
+            "stream_sync_s": 0.0,
+            "total_s": 0.0,
+            "success": False,
+            "per_layer": [],
+            "sum_tensors_loaded": 0,
+            "sum_h2d_enqueue_s": 0.0,
+            "sum_h2d_dma_gpu_s": 0.0,
+            "sum_gpu_copy_apply_s": 0.0,
+            "sum_gpu_copy_apply_gpu_s": 0.0,
+            "sum_cpu_fuse_cat_s": 0.0,
+            "sum_load_weights_s": 0.0,
+            "sum_alpha_flip_s": 0.0,
+            "sum_h2d_bytes": 0,
+            "sum_gpu_copy_bytes": 0,
+            "effective_h2d_gbps": 0.0,
+            "effective_gpu_copy_gbps": 0.0,
+        }
+        total_t0 = time.perf_counter()
+
+        try:
+            def _activate_one(layer_idx: int, layer_weights: Dict[str, torch.Tensor]) -> None:
+                layer_wrapper = self.layers[layer_idx]
+                layer_profile: Dict[str, Any] = {
+                    "layer_idx": layer_idx,
+                    "weights_found": len(layer_weights),
+                    "already_active": False,
+                    "tensors_loaded": 0,
+                    "load_weights_s": 0.0,
+                    "alpha_flip_s": 0.0,
+                    "h2d_enqueue_s": 0.0,
+                    "h2d_dma_gpu_s": 0.0,
+                    "gpu_copy_apply_s": 0.0,
+                    "gpu_copy_apply_gpu_s": 0.0,
+                    "cpu_fuse_cat_s": 0.0,
+                    "h2d_bytes": 0,
+                    "gpu_copy_bytes": 0,
+                }
+
+                if layer_wrapper.is_active():
+                    print(f"  Layer {layer_idx}: already active")
+                    layer_profile["already_active"] = True
+                    profile["per_layer"].append(layer_profile)
+                    return
 
                 if not layer_weights:
                     print(f"  ⚠️ No weights for layer {layer_idx}")
-                    continue
+                    profile["per_layer"].append(layer_profile)
+                    return
 
-                loaded = self._load_layer_weights(
-                    layer_wrapper.layer, layer_weights, weight_pattern, device
-                )
+                load_t0 = time.perf_counter()
+                with _nvtx_range("p2_instant_load_layer_weights"):
+                    loaded, load_profile = self._load_layer_weights(
+                        layer_wrapper.layer,
+                        layer_weights,
+                        weight_pattern,
+                        device,
+                        return_profile=True,
+                    )
+                layer_profile["load_weights_s"] = time.perf_counter() - load_t0
                 print(f"  ✅ Layer {layer_idx}: {loaded} tensors → GPU")
 
-                layer_wrapper.activate()
+                alpha_t0 = time.perf_counter()
+                with _nvtx_range("p2_instant_alpha_flip"):
+                    layer_wrapper.activate()
+                layer_profile["alpha_flip_s"] = time.perf_counter() - alpha_t0
                 self.initially_inactive.discard(layer_idx)
                 print(f"  ✅ Layer {layer_idx} activated (alpha 0→1)")
+                layer_profile["tensors_loaded"] = loaded
+                layer_profile["h2d_enqueue_s"] = load_profile["h2d_enqueue_s"]
+                layer_profile["h2d_dma_gpu_s"] = load_profile["h2d_dma_gpu_s"]
+                layer_profile["gpu_copy_apply_s"] = load_profile["gpu_copy_apply_s"]
+                layer_profile["gpu_copy_apply_gpu_s"] = load_profile["gpu_copy_apply_gpu_s"]
+                layer_profile["cpu_fuse_cat_s"] = load_profile["cpu_fuse_cat_s"]
+                layer_profile["h2d_bytes"] = int(load_profile.get("h2d_bytes", 0))
+                layer_profile["gpu_copy_bytes"] = int(load_profile.get("gpu_copy_bytes", 0))
+                profile["per_layer"].append(layer_profile)
 
-            # non_blocking=True copy가 모두 GPU에서 완료될 때까지 대기
-            # SKBI / forward가 이 weights를 즉시 사용하므로 필수
-            torch.cuda.synchronize()
+            if use_cuda_streams:
+                schedule_t0 = time.perf_counter()
+                with _nvtx_range("p2_instant_multistream_schedule"):
+                    for i, (layer_idx, layer_weights) in enumerate(layers_data):
+                        stream = streams[i % num_streams]
+                        with torch.cuda.stream(stream):
+                            _activate_one(layer_idx, layer_weights)
+                profile["apply_schedule_s"] = time.perf_counter() - schedule_t0
+
+                sync_t0 = time.perf_counter()
+                with _nvtx_range("p2_instant_multistream_sync"):
+                    for stream in streams:
+                        stream.synchronize()
+                profile["stream_sync_s"] = time.perf_counter() - sync_t0
+            else:
+                apply_t0 = time.perf_counter()
+                with _nvtx_range("p2_instant_single_stream_apply"):
+                    for layer_idx, layer_weights in layers_data:
+                        _activate_one(layer_idx, layer_weights)
+                profile["apply_schedule_s"] = time.perf_counter() - apply_t0
+
+            profile["total_s"] = time.perf_counter() - total_t0
+            profile["success"] = True
+            for lp in profile["per_layer"]:
+                profile["sum_tensors_loaded"] += int(lp.get("tensors_loaded", 0))
+                profile["sum_h2d_enqueue_s"] += float(lp.get("h2d_enqueue_s", 0.0))
+                profile["sum_h2d_dma_gpu_s"] += float(lp.get("h2d_dma_gpu_s", 0.0))
+                profile["sum_gpu_copy_apply_s"] += float(lp.get("gpu_copy_apply_s", 0.0))
+                profile["sum_gpu_copy_apply_gpu_s"] += float(lp.get("gpu_copy_apply_gpu_s", 0.0))
+                profile["sum_cpu_fuse_cat_s"] += float(lp.get("cpu_fuse_cat_s", 0.0))
+                profile["sum_load_weights_s"] += float(lp.get("load_weights_s", 0.0))
+                profile["sum_alpha_flip_s"] += float(lp.get("alpha_flip_s", 0.0))
+                profile["sum_h2d_bytes"] += int(lp.get("h2d_bytes", 0))
+                profile["sum_gpu_copy_bytes"] += int(lp.get("gpu_copy_bytes", 0))
+            profile["sum_h2d_enqueue_overhead_s"] = max(
+                profile["sum_h2d_enqueue_s"] - profile["sum_h2d_dma_gpu_s"], 0.0
+            )
+            profile["sum_gpu_copy_apply_overhead_s"] = max(
+                profile["sum_gpu_copy_apply_s"] - profile["sum_gpu_copy_apply_gpu_s"], 0.0
+            )
+            if profile["sum_h2d_dma_gpu_s"] > 0:
+                profile["effective_h2d_gbps"] = (
+                    profile["sum_h2d_bytes"] / 1e9 / profile["sum_h2d_dma_gpu_s"]
+                )
+            if profile["sum_gpu_copy_apply_gpu_s"] > 0:
+                profile["effective_gpu_copy_gbps"] = (
+                    profile["sum_gpu_copy_bytes"] / 1e9 / profile["sum_gpu_copy_apply_gpu_s"]
+                )
+            self._last_instant_activation_profile = profile
+
+            print(
+                "[InstantProfile] "
+                f"total={profile['total_s']:.4f}s "
+                f"(extract={profile['extract_layers_data_s']:.4f}s, "
+                f"apply={profile['apply_schedule_s']:.4f}s, "
+                f"sync={profile['stream_sync_s']:.4f}s, "
+                f"h2d_enqueue={profile['sum_h2d_enqueue_s']:.4f}s, "
+                f"h2d_dma={profile['sum_h2d_dma_gpu_s']:.4f}s, "
+                f"h2d_overhead={profile['sum_h2d_enqueue_overhead_s']:.4f}s, "
+                f"h2d_bytes={profile['sum_h2d_bytes'] / (1024**2):.1f}MiB, "
+                f"h2d_gbps={profile['effective_h2d_gbps']:.2f}, "
+                f"gpu_copy_cpu={profile['sum_gpu_copy_apply_s']:.4f}s, "
+                f"gpu_copy_gpu={profile['sum_gpu_copy_apply_gpu_s']:.4f}s, "
+                f"gpu_copy_bytes={profile['sum_gpu_copy_bytes'] / (1024**2):.1f}MiB, "
+                f"gpu_copy_gbps={profile['effective_gpu_copy_gbps']:.2f}, "
+                f"alpha={profile['sum_alpha_flip_s']:.4f}s)"
+            )
             print(f"\n✅ Instant activation complete")
             print(f"ℹ️  Topology는 고정되지만, vLLM 런타임에서 graph 재캡처가 발생할 수 있음\n")
             return True
@@ -1065,6 +1464,11 @@ class ProgressiveModelDualPath(nn.Module):
                 del self._prefetch_path
             if hasattr(self, '_prefetch_indices'):
                 del self._prefetch_indices
+
+    def get_last_instant_activation_profile(self) -> Optional[Dict[str, Any]]:
+        if self._last_instant_activation_profile is None:
+            return None
+        return copy.deepcopy(self._last_instant_activation_profile)
 
     def is_prefetch_ready(self) -> bool:
         """prefetch 완료 여부 확인 (non-blocking)"""
@@ -1106,6 +1510,7 @@ class ProgressiveModelDualPath(nn.Module):
             "in_progress": in_progress,
             "checkpoint_path": getattr(self, '_prefetch_path', None),
             "layer_indices": list(getattr(self, '_prefetch_indices', [])),
+            "prefetch_profile": copy.deepcopy(self._last_prefetch_profile),
         }
 
     def _load_layer_weights(
@@ -1114,40 +1519,81 @@ class ProgressiveModelDualPath(nn.Module):
         layer_weights: Dict[str, torch.Tensor],
         weight_pattern: Any,
         device: torch.device,
-    ) -> int:
+        return_profile: bool = False,
+    ):
         """
         범용 가중치 로딩 로직
         
         모델별 가중치 이름 패턴에 따라 자동으로 처리합니다.
         """
         loaded_count = 0
+        profile = {
+            "h2d_enqueue_s": 0.0,
+            "h2d_dma_gpu_s": 0.0,
+            "gpu_copy_apply_s": 0.0,
+            "gpu_copy_apply_gpu_s": 0.0,
+            "cpu_fuse_cat_s": 0.0,
+            "h2d_bytes": 0,
+            "gpu_copy_bytes": 0,
+        }
         
         for name, param in layer.named_parameters():
             # QKV fusion 처리
             if weight_pattern.qkv_fused_name and weight_pattern.qkv_fused_name in name:
-                qkv_loaded = self._load_qkv_fused(
-                    param, name, layer_weights, weight_pattern, device
+                qkv_loaded, qkv_profile = self._load_qkv_fused(
+                    param, name, layer_weights, weight_pattern, device, return_profile=True
                 )
                 if qkv_loaded:
                     loaded_count += 1
+                    profile["h2d_enqueue_s"] += qkv_profile["h2d_enqueue_s"]
+                    profile["h2d_dma_gpu_s"] += qkv_profile["h2d_dma_gpu_s"]
+                    profile["gpu_copy_apply_s"] += qkv_profile["gpu_copy_apply_s"]
+                    profile["gpu_copy_apply_gpu_s"] += qkv_profile["gpu_copy_apply_gpu_s"]
+                    profile["cpu_fuse_cat_s"] += qkv_profile["cpu_fuse_cat_s"]
+                    profile["h2d_bytes"] += int(qkv_profile.get("h2d_bytes", 0))
+                    profile["gpu_copy_bytes"] += int(qkv_profile.get("gpu_copy_bytes", 0))
                     continue
             
             # MLP Gate-Up fusion 처리
             if weight_pattern.mlp_fused_name and weight_pattern.mlp_fused_name in name:
-                mlp_loaded = self._load_mlp_fused(
-                    param, name, layer_weights, weight_pattern, device
+                mlp_loaded, mlp_profile = self._load_mlp_fused(
+                    param, name, layer_weights, weight_pattern, device, return_profile=True
                 )
                 if mlp_loaded:
                     loaded_count += 1
+                    profile["h2d_enqueue_s"] += mlp_profile["h2d_enqueue_s"]
+                    profile["h2d_dma_gpu_s"] += mlp_profile["h2d_dma_gpu_s"]
+                    profile["gpu_copy_apply_s"] += mlp_profile["gpu_copy_apply_s"]
+                    profile["gpu_copy_apply_gpu_s"] += mlp_profile["gpu_copy_apply_gpu_s"]
+                    profile["cpu_fuse_cat_s"] += mlp_profile["cpu_fuse_cat_s"]
+                    profile["h2d_bytes"] += int(mlp_profile.get("h2d_bytes", 0))
+                    profile["gpu_copy_bytes"] += int(mlp_profile.get("gpu_copy_bytes", 0))
                     continue
             
             # 일반 weights (direct match)
             if name in layer_weights:
-                param.data.copy_(layer_weights[name], non_blocking=True)
+                with _nvtx_range("p2_instant_h2d_enqueue"):
+                    weight_gpu, h2d_cpu_s, h2d_dma_gpu_s = self._timed_cuda_op(
+                        lambda: layer_weights[name].to(device, non_blocking=True),
+                        device,
+                    )
+                profile["h2d_enqueue_s"] += h2d_cpu_s
+                profile["h2d_dma_gpu_s"] += h2d_dma_gpu_s
+                with _nvtx_range("p2_instant_gpu_copy_apply"):
+                    _, copy_cpu_s, copy_gpu_s = self._timed_cuda_op(
+                        lambda: param.data.copy_(weight_gpu),
+                        device,
+                    )
+                profile["gpu_copy_apply_s"] += copy_cpu_s
+                profile["gpu_copy_apply_gpu_s"] += copy_gpu_s
+                profile["h2d_bytes"] += int(layer_weights[name].numel() * layer_weights[name].element_size())
+                profile["gpu_copy_bytes"] += int(param.numel() * param.element_size())
                 loaded_count += 1
-
+        
+        if return_profile:
+            return loaded_count, profile
         return loaded_count
-
+    
     def _load_qkv_fused(
         self,
         param,
@@ -1155,8 +1601,18 @@ class ProgressiveModelDualPath(nn.Module):
         layer_weights: Dict[str, torch.Tensor],
         weight_pattern: Any,
         device: torch.device,
-    ) -> bool:
+        return_profile: bool = False,
+    ):
         """QKV fusion weight 로드"""
+        profile = {
+            "h2d_enqueue_s": 0.0,
+            "h2d_dma_gpu_s": 0.0,
+            "gpu_copy_apply_s": 0.0,
+            "gpu_copy_apply_gpu_s": 0.0,
+            "cpu_fuse_cat_s": 0.0,
+            "h2d_bytes": 0,
+            "gpu_copy_bytes": 0,
+        }
         # Build expected weight names
         weight_names = []
         for proj_name in weight_pattern.qkv_weights:
@@ -1168,16 +1624,38 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            offset = 0
-            for name in weight_names:
-                w = layer_weights[name]
-                param.data[offset:offset + w.shape[0]].copy_(w, non_blocking=True)
-                offset += w.shape[0]
+            cat_t0 = time.perf_counter()
+            with _nvtx_range("p2_instant_qkv_cpu_fuse_cat"):
+                fused_weight = torch.cat([
+                    layer_weights[name] for name in weight_names
+                ], dim=0)
+            profile["cpu_fuse_cat_s"] += time.perf_counter() - cat_t0
+            
+            with _nvtx_range("p2_instant_h2d_enqueue"):
+                weight_gpu, h2d_cpu_s, h2d_dma_gpu_s = self._timed_cuda_op(
+                    lambda: fused_weight.to(device, non_blocking=True),
+                    device,
+                )
+            profile["h2d_enqueue_s"] += h2d_cpu_s
+            profile["h2d_dma_gpu_s"] += h2d_dma_gpu_s
+            with _nvtx_range("p2_instant_gpu_copy_apply"):
+                _, copy_cpu_s, copy_gpu_s = self._timed_cuda_op(
+                    lambda: param.data.copy_(weight_gpu),
+                    device,
+                )
+            profile["gpu_copy_apply_s"] += copy_cpu_s
+            profile["gpu_copy_apply_gpu_s"] += copy_gpu_s
+            profile["h2d_bytes"] += int(fused_weight.numel() * fused_weight.element_size())
+            profile["gpu_copy_bytes"] += int(param.numel() * param.element_size())
             print(f"  ✅ Loaded fused QKV ({len(weight_names)} weights)")
+            if return_profile:
+                return True, profile
             return True
-
+        
+        if return_profile:
+            return False, profile
         return False
-
+    
     def _load_mlp_fused(
         self,
         param,
@@ -1185,10 +1663,30 @@ class ProgressiveModelDualPath(nn.Module):
         layer_weights: Dict[str, torch.Tensor],
         weight_pattern: Any,
         device: torch.device,
-    ) -> bool:
+        return_profile: bool = False,
+    ):
         """MLP Gate-Up fusion weight 로드"""
         if not weight_pattern.mlp_gate_up:
+            if return_profile:
+                return False, {
+                    "h2d_enqueue_s": 0.0,
+                    "h2d_dma_gpu_s": 0.0,
+                    "gpu_copy_apply_s": 0.0,
+                    "gpu_copy_apply_gpu_s": 0.0,
+                    "cpu_fuse_cat_s": 0.0,
+                    "h2d_bytes": 0,
+                    "gpu_copy_bytes": 0,
+                }
             return False
+        profile = {
+            "h2d_enqueue_s": 0.0,
+            "h2d_dma_gpu_s": 0.0,
+            "gpu_copy_apply_s": 0.0,
+            "gpu_copy_apply_gpu_s": 0.0,
+            "cpu_fuse_cat_s": 0.0,
+            "h2d_bytes": 0,
+            "gpu_copy_bytes": 0,
+        }
         
         # Build expected weight names
         weight_names = []
@@ -1200,16 +1698,38 @@ class ProgressiveModelDualPath(nn.Module):
         
         # Check if all weights exist
         if all(name in layer_weights for name in weight_names):
-            offset = 0
-            for name in weight_names:
-                w = layer_weights[name]
-                param.data[offset:offset + w.shape[0]].copy_(w, non_blocking=True)
-                offset += w.shape[0]
+            cat_t0 = time.perf_counter()
+            with _nvtx_range("p2_instant_mlp_cpu_fuse_cat"):
+                fused_weight = torch.cat([
+                    layer_weights[name] for name in weight_names
+                ], dim=0)
+            profile["cpu_fuse_cat_s"] += time.perf_counter() - cat_t0
+            
+            with _nvtx_range("p2_instant_h2d_enqueue"):
+                weight_gpu, h2d_cpu_s, h2d_dma_gpu_s = self._timed_cuda_op(
+                    lambda: fused_weight.to(device, non_blocking=True),
+                    device,
+                )
+            profile["h2d_enqueue_s"] += h2d_cpu_s
+            profile["h2d_dma_gpu_s"] += h2d_dma_gpu_s
+            with _nvtx_range("p2_instant_gpu_copy_apply"):
+                _, copy_cpu_s, copy_gpu_s = self._timed_cuda_op(
+                    lambda: param.data.copy_(weight_gpu),
+                    device,
+                )
+            profile["gpu_copy_apply_s"] += copy_cpu_s
+            profile["gpu_copy_apply_gpu_s"] += copy_gpu_s
+            profile["h2d_bytes"] += int(fused_weight.numel() * fused_weight.element_size())
+            profile["gpu_copy_bytes"] += int(param.numel() * param.element_size())
             print(f"  ✅ Loaded fused MLP ({len(weight_names)} weights)")
+            if return_profile:
+                return True, profile
             return True
-
+        
+        if return_profile:
+            return False, profile
         return False
-
+    
     # ================================================================
     # Status Methods (CUDA Graph safe!)
     # ================================================================

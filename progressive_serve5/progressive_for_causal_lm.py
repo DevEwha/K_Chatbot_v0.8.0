@@ -1,0 +1,1150 @@
+"""
+Universal ProgressiveForCausalLM with Dual-Path Design
+vLLM v0.8.0 Compatible (v0 engine) - Supports All Decoder-Only Models
+
+✅ 모든 Decoder-only 모델 지원
+✅ Path A/B 둘 다 항상 계산 (CUDA Graph topology 불변)
+✅ Alpha로 경로 선택
+✅ prune_log.json 기반 자동 레이어 결정
+✅ v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
+
+<핵심 기능>
+_load_prune_log: 모델 폴더의 prune_log.json을 읽어서 "이번엔 몇 번 레이어를 끄고 시작할까?"를 결정
+
+load_weights: model_config.py의 정보를 이용해 체크포인트 파일에서 가중치를 읽어와 모델에 집어넣음.
+만약 꺼진 레이어(Inactive)라면 가중치를 0으로 채워 메모리를 아끼거나 초기화 이슈를 방지합니다.
+
+advance_to_stageX: 다음 단계로 넘어갈 때 필요한 추가 가중치 파일(Safetensors)을 로드하고, model.activate_layers를 호출
+"""
+
+from typing import Optional, List, Iterable, Tuple, Any, Dict
+from contextlib import contextmanager
+from collections import defaultdict
+import os
+import time
+import re
+import torch
+import torch.nn as nn
+import sys
+from vllm.config import VllmConfig
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.models.utils import WeightsMapper
+
+# Weight loader
+try:
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+except ImportError:
+    default_weight_loader = None
+
+# Universal Dual-Path implementation (same directory, no need for sys.path)
+from progressive_model_dual_path import ProgressiveModelDualPath
+from model_config import get_model_type, get_weight_pattern
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    active = False
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(name)
+            active = True
+        except Exception:
+            active = False
+    try:
+        yield
+    finally:
+        if active:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+
+
+class ProgressiveForCausalLM(nn.Module):
+    """
+    Universal ForCausalLM wrapper with Dual-Path Design (vLLM v0.8.0, v0 engine)
+
+    지원 모델:
+    - LLaMA (1, 2, 3), CodeLlama, Vicuna, Alpaca
+    - Mistral, Mixtral
+    - Qwen2
+    - Gemma (1, 2)
+    - Phi (2, 3)
+    - GPT-2, GPT-NeoX
+    - Falcon
+    - DeepSeek (v1, v2)
+    - Yi
+
+    핵심:
+    - Path A/B 둘 다 항상 계산
+    - Alpha로 경로 선택
+    - 완벽한 CUDA Graph safety
+    - v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
+    """
+    supports_multimodal = False
+    supports_pooling = False 
+    embedding_mode = False
+    task = "generate"
+    supports_lora = True
+    packed_modules_mapping = {
+        # Llama/Mistral/Qwen/Gemma 등 fused QKV.
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        # Llama/Mistral 계열 fused MLP.
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        # Falcon pre-fused QKV.
+        "query_key_value": ["query_key_value"],
+    }
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    embedding_padding_modules = ["lm_head"]
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        stage: int = 1,
+    ):
+        super().__init__()
+        
+        self.supports_lora = True
+        self.embedding_mode = False
+        
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.vllm_config = vllm_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+        self.lora_config = lora_config
+        
+        # Get normalized model type
+        self.model_type = get_model_type(config)
+        if self.model_type == "falcon":
+            # Falcon adapters in this setup target transformer blocks only.
+            # Keep embedding map non-null (vLLM dummy LoRA asserts it), but empty.
+            self.packed_modules_mapping = {
+                "query_key_value": ["query_key_value"],
+            }
+            self.embedding_modules = {}
+            self.embedding_padding_modules = []
+        elif self.model_type == "phi3":
+            self.packed_modules_mapping = {
+                "qkv_proj": ["qkv_proj"],
+                "gate_up_proj": ["gate_up_proj"],
+            }
+            self.embedding_modules = {
+                "embed_tokens": "input_embeddings",
+                "lm_head": "output_embeddings",
+            }
+            self.embedding_padding_modules = ["lm_head"]
+        else:
+            self.packed_modules_mapping = {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_proj", "up_proj"],
+                "query_key_value": ["query_key_value"],
+            }
+            self.embedding_modules = {
+                "embed_tokens": "input_embeddings",
+                "lm_head": "output_embeddings",
+            }
+            self.embedding_padding_modules = ["lm_head"]
+        self.hf_to_vllm_mapper = self._build_hf_to_vllm_mapper()
+        
+        if not hasattr(config, 'model_type'):
+            config.model_type = self.model_type
+        
+        # Model path 가져오기
+        model_path = vllm_config.model_config.model
+        
+        # prune_log.json 로드
+        self.prune_info = self._load_prune_log(model_path)
+        
+        # Stage에 따른 inactive layer indices (prune_log 기반)
+        inactive_indices = self._get_inactive_indices_from_prune_log(self.prune_info, stage)
+        
+        # Model 생성 (Universal Dual-Path)
+        self.model = ProgressiveModelDualPath(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.model" if prefix else "model",
+            pruned_layer_indices=inactive_indices,
+        )
+        
+        self.unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.mup_width_multiplier = getattr(config, "mup_width_multiplier", 1.0)
+
+        # LM head (LoRA-aware vocab sizing, fixed at init for CUDA graph safety)
+        lm_head_padding_size = (
+            DEFAULT_VOCAB_PADDING_SIZE if not lora_config else
+            lora_config.lora_vocab_padding_size
+        )
+        self.lm_head = ParallelLMHead(
+            self.unpadded_vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            padding_size=lm_head_padding_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+        )
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+
+        # vLLM v0.8.0: LogitsProcessor + Sampler
+        logit_scale = getattr(config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size,
+                                                logit_scale)
+        self.sampler = get_sampler()
+        if hasattr(config, "dummy_token_indices"):
+            self.register_buffer(
+                "dummy_token_indices",
+                torch.LongTensor(config.dummy_token_indices),
+                persistent=False,
+            )
+        else:
+            self.dummy_token_indices = None
+
+        # Stage
+        self.current_stage = stage
+
+        # Inactive layer tracking (for weight loading)
+        self.inactive_layer_indices = set(inactive_indices)
+        self._stage1_copy_profile_enabled = (
+            os.getenv("P2_STAGE1_COPY_PROFILE", "0") == "1"
+        )
+        self._stage1_io_touch_enabled = (
+            os.getenv("P2_STAGE1_IO_TOUCH", "1") == "1"
+        )
+        self._stage1_copy_profile_records: list[tuple] = []
+        try:
+            self._instant_streams = max(1, int(os.getenv("P2_INSTANT_STREAMS", "4")))
+        except Exception:
+            self._instant_streams = 4
+        self._disable_persistent_cache_writes = (
+            os.getenv("P2_DISABLE_PERSISTENT_CACHE_WRITES", "0") == "1"
+        )
+        if self._disable_persistent_cache_writes:
+            print("⚙️  Persistent cache writes disabled (P2_DISABLE_PERSISTENT_CACHE_WRITES=1)")
+
+        # 초기 캐싱 범위 설정
+        max_cacheable = self._get_max_cacheable_layer()
+        if self._disable_persistent_cache_writes:
+            self.model._max_cacheable_layer = -1
+            print("✅ Initial cache limit: disabled")
+        else:
+            self.model._max_cacheable_layer = max_cacheable
+            if max_cacheable is not None:
+                print(f"✅ Initial cache limit: layers 0-{max_cacheable}")
+        
+        print(f"\n{'='*60}")
+        print(f"ProgressiveForCausalLM (Universal, vLLM v0.8.0 v0 engine)")
+        print(f"Model Type: {self.model_type}")
+        print(f"Model Path: {model_path}")
+        print(f"Initialized at Stage {stage}")
+        if self.prune_info:
+            print(f"✅ Prune log loaded from: {model_path}/prune_log.json")
+            print(f"   Split B (Stage 2): {self.prune_info['split']['B']}")
+            print(f"   Split C (Stage 3): {self.prune_info['split']['C']}")
+        else:
+            print(f"⚠️  Using fallback inactive layers (no prune_log.json)")
+        print(f"Initially inactive layers: {sorted(inactive_indices)}")
+        print(f"🎯 Dual-Path: Path A/B always computed")
+        print(f"✅ CUDA Graph safe: Topology invariant")
+        print(f"✅ LoRA runtime support: {'enabled' if self.supports_lora else 'disabled'}")
+        print(f"⚙️ Instant activation streams: {self._instant_streams}")
+        print(f"{'='*60}\n")
+
+    def _build_hf_to_vllm_mapper(self):
+        """
+        LoRA adapter key path를 Progressive 래핑 경로(model.layers.N.layer.*)로 변환.
+        - Falcon: transformer.h.N.* -> model.layers.N.layer.*
+        - Llama(custom): _canonical_layers.N.* -> model.layers.N.layer.*
+        - Mistral/Qwen 계열: model.layers.N.* -> model.layers.N.layer.*
+        """
+        model_type = str(self.model_type).strip().lower()
+
+        class _ProgressiveLoRAWeightsMapper(WeightsMapper):
+            def __init__(self, model_type_: str):
+                super().__init__()
+                self._model_type = model_type_
+                self._falcon_h_pat = re.compile(r"^transformer\.h\.(\d+)\.")
+                self._canon_layers_pat = re.compile(r"^_canonical_layers\.(\d+)\.")
+                self._std_layers_pat = re.compile(r"^model\.layers\.(\d+)\.(?!layer\.)")
+
+            def _map_name(self, key: str) -> Optional[str]:
+                # Falcon HF keys -> progressive wrapper keys.
+                if self._model_type == "falcon":
+                    key = self._falcon_h_pat.sub(r"model.layers.\1.layer.", key, count=1)
+                    key = key.replace("transformer.word_embeddings.", "model.embed_tokens.")
+                    key = key.replace("transformer.ln_f.", "model.norm.")
+
+                # Llama adapters in this project sometimes use _canonical_layers.
+                key = self._canon_layers_pat.sub(r"model.layers.\1.layer.", key, count=1)
+
+                # For model.layers.N.* style keys, inject wrapper ".layer." once.
+                key = self._std_layers_pat.sub(r"model.layers.\1.layer.", key, count=1)
+                return key
+
+        return _ProgressiveLoRAWeightsMapper(model_type)
+    
+    def _load_prune_log(self, model_path: str) -> Optional[dict]:
+        """모델 디렉토리에서 prune_log.json 로드"""
+        import json
+        import os
+        
+        prune_log_path = os.path.join(model_path, "prune_log.json")
+        
+        if not os.path.exists(prune_log_path):
+            return None
+        
+        try:
+            with open(prune_log_path, 'r') as f:
+                prune_log = json.load(f)
+            
+            # 필수 필드 확인
+            if 'split' not in prune_log:
+                print(f"⚠️  Warning: 'split' field not found in prune_log.json")
+                return None
+            
+            if 'B' not in prune_log['split'] or 'C' not in prune_log['split']:
+                print(f"⚠️  Warning: 'B' or 'C' not found in split")
+                return None
+            
+            return prune_log
+            
+        except Exception as e:
+            print(f"❌ Error loading prune_log.json: {e}")
+            return None
+    
+    def _get_inactive_indices_from_prune_log(
+        self, 
+        prune_info: Optional[dict], 
+        stage: int
+    ) -> List[int]:
+        """prune_log.json의 split 정보를 바탕으로 inactive layer indices 결정"""
+        # Fallback: prune_log가 없으면 기본값 사용
+        if prune_info is None:
+            return self._get_inactive_indices_fallback(stage)
+        
+        try:
+            split_b = prune_info['split']['B']
+            split_c = prune_info['split']['C']
+            
+            if stage == 1:
+                # Stage 1: B + C 모두 inactive
+                inactive = sorted(split_b + split_c)
+            elif stage == 2:
+                # Stage 2: C만 inactive
+                inactive = sorted(split_c)
+            elif stage == 3:
+                # Stage 3: 모두 active
+                inactive = []
+            else:
+                raise ValueError(f"Invalid stage: {stage}. Must be 1, 2, or 3")
+            
+            return inactive
+            
+        except Exception as e:
+            print(f"❌ Error parsing prune_log: {e}")
+            print(f"   Falling back to default inactive layers")
+            return self._get_inactive_indices_fallback(stage)
+    
+    def _get_inactive_indices_fallback(self, stage: int) -> List[int]:
+        """
+        Fallback: prune_log가 없을 때 기본값
+        
+        모델별로 다른 레이어 수를 고려합니다.
+        """
+        num_layers = self.config.num_hidden_layers
+        
+        if stage == 1:
+            # Last ~25% of layers inactive
+            start = int(num_layers * 0.75)
+            return list(range(start, num_layers))
+        elif stage == 2:
+            # Last ~12% of layers inactive
+            start = int(num_layers * 0.88)
+            return list(range(start, num_layers))
+        elif stage == 3:
+            return []  # 모두 활성
+        else:
+            raise ValueError(f"Invalid stage: {stage}")
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """vLLM v1 인터페이스: 토큰 임베딩"""
+        return self.model.embed_tokens(input_ids)
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        """vLLM v0.8.0 v0 engine: logits 계산 (sampling_metadata 필요)"""
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata)
+        if self.dummy_token_indices is not None and logits is not None:
+            dummy_token_indices = self.dummy_token_indices.to(
+                device=logits.device,
+                non_blocking=True,
+            )
+            logits.index_fill_(-1, dummy_token_indices, -torch.inf)
+        return logits
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        """vLLM v0.8.0 v0 engine: sampling"""
+        if self.model_type == "phi3small":
+            logits = logits / self.mup_width_multiplier
+        next_tokens = self.sampler(logits, sampling_metadata)
+        return next_tokens
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[Any] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """vLLM v0.8.0 v0 engine 호환 forward"""
+        # Universal Dual-Path model forward
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+        return hidden_states
+    
+    # ============================================================
+    # Weight Loading (Universal, vLLM v0.8.0 compatible)
+    # ============================================================
+    def _run_profiled_weight_loader(
+        self,
+        tag: str,
+        param: torch.Tensor,
+        tensor: torch.Tensor,
+        weight_loader,
+    ) -> None:
+        if not self._stage1_copy_profile_enabled or not torch.cuda.is_available():
+            with _nvtx_range(tag):
+                with _nvtx_range("H2D:weight_loader_enqueue"):
+                    weight_loader(param, tensor)
+            return
+
+        stream = torch.cuda.current_stream()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        enqueue_t0 = time.perf_counter_ns()
+        with _nvtx_range(f"{tag}_h2d_enqueue"):
+            with _nvtx_range("H2D:weight_loader_enqueue"):
+                start_evt.record(stream)
+                weight_loader(param, tensor)
+                end_evt.record(stream)
+        enqueue_ns = time.perf_counter_ns() - enqueue_t0
+
+        src_is_cpu = (hasattr(tensor, "device") and tensor.device.type == "cpu")
+        src_is_pinned = bool(src_is_cpu and hasattr(tensor, "is_pinned")
+                             and tensor.is_pinned())
+        nbytes = int(tensor.numel() * tensor.element_size()) \
+            if hasattr(tensor, "numel") else 0
+        self._stage1_copy_profile_records.append(
+            (tag, start_evt, end_evt, enqueue_ns, nbytes, src_is_cpu, src_is_pinned)
+        )
+
+    def _stage1_touch_tensor_for_io(self, tensor: torch.Tensor) -> None:
+        if not self._stage1_io_touch_enabled:
+            return
+        if not hasattr(tensor, "device") or tensor.device.type != "cpu":
+            return
+        with _nvtx_range("IO:tensor_touch"):
+            try:
+                if tensor.numel() > 0:
+                    _ = tensor.view(-1)[0].item()
+            except Exception:
+                pass
+
+    def _finalize_stage1_copy_profile(self) -> None:
+        if (not self._stage1_copy_profile_enabled
+                or not self._stage1_copy_profile_records
+                or not torch.cuda.is_available()):
+            return
+
+        with _nvtx_range("p2_stage1_copy_profile_finalize"):
+            torch.cuda.synchronize()
+
+        agg = defaultdict(lambda: {
+            "calls": 0,
+            "enqueue_ns": 0,
+            "gpu_ms": 0.0,
+            "bytes": 0,
+            "cpu_src_calls": 0,
+            "pinned_src_calls": 0,
+        })
+        total = {
+            "calls": 0,
+            "enqueue_ns": 0,
+            "gpu_ms": 0.0,
+            "bytes": 0,
+            "cpu_src_calls": 0,
+            "pinned_src_calls": 0,
+        }
+
+        for tag, start_evt, end_evt, enqueue_ns, nbytes, src_is_cpu, src_is_pinned in \
+                self._stage1_copy_profile_records:
+            gpu_ms = float(start_evt.elapsed_time(end_evt))
+            stat = agg[tag]
+            stat["calls"] += 1
+            stat["enqueue_ns"] += enqueue_ns
+            stat["gpu_ms"] += gpu_ms
+            stat["bytes"] += nbytes
+            if src_is_cpu:
+                stat["cpu_src_calls"] += 1
+            if src_is_pinned:
+                stat["pinned_src_calls"] += 1
+
+            total["calls"] += 1
+            total["enqueue_ns"] += enqueue_ns
+            total["gpu_ms"] += gpu_ms
+            total["bytes"] += nbytes
+            if src_is_cpu:
+                total["cpu_src_calls"] += 1
+            if src_is_pinned:
+                total["pinned_src_calls"] += 1
+
+        def _gbps(byte_count: int, gpu_ms: float) -> float:
+            if gpu_ms <= 0.0:
+                return 0.0
+            return (byte_count / 1e9) / (gpu_ms / 1e3)
+
+        print("\n" + "=" * 60)
+        print("STAGE1 COPY PROFILE (enqueue vs GPU event)")
+        print("=" * 60)
+        print("tag | calls | bytes(GB) | enqueue(s) | gpu_event(s) | est_gpu_GB/s | cpu_src | pinned_src")
+        for tag, stat in sorted(agg.items(), key=lambda x: x[1]["bytes"], reverse=True):
+            print(
+                f"{tag} | {stat['calls']} | {stat['bytes']/1e9:.3f} | "
+                f"{stat['enqueue_ns']/1e9:.3f} | {stat['gpu_ms']/1e3:.3f} | "
+                f"{_gbps(stat['bytes'], stat['gpu_ms']):.3f} | "
+                f"{stat['cpu_src_calls']} | {stat['pinned_src_calls']}"
+            )
+        print("-" * 60)
+        print(
+            f"TOTAL | {total['calls']} | {total['bytes']/1e9:.3f} | "
+            f"{total['enqueue_ns']/1e9:.3f} | {total['gpu_ms']/1e3:.3f} | "
+            f"{_gbps(total['bytes'], total['gpu_ms']):.3f} | "
+            f"{total['cpu_src_calls']} | {total['pinned_src_calls']}"
+        )
+        print("=" * 60 + "\n")
+
+        self._stage1_copy_profile_records.clear()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """
+        범용 weight loading (vLLM v0.8.0 호환)
+        
+        모델 타입에 따라 자동으로 가중치 이름 패턴을 적용합니다.
+        """
+        print(f"\n{'='*60}")
+        print(f"LOADING WEIGHTS (Universal, vLLM v0.8.0)")
+        print(f"Model Type: {self.model_type}")
+        print(f"{'='*60}")
+        
+        # Convert iterator to dict for easier handling
+        checkpoint_weights = {}
+        with _nvtx_range("p2_stage1_checkpoint_collect_dict"):
+            with _nvtx_range("IO:checkpoint_iter"):
+                for name, tensor in weights:
+                    checkpoint_weights[name] = tensor
+
+        # Phi-3-small HF checkpoints save the final norm as
+        # `model.final_layernorm.{weight,bias}`, while the progressive runtime
+        # exposes the top-level parameter names `model.norm.{weight,bias}`.
+        if self.model_type == "phi3small":
+            final_norm_key_pairs = (
+                ("model.final_layernorm.weight", "model.norm.weight"),
+                ("model.final_layernorm.bias", "model.norm.bias"),
+            )
+            remapped_norm_keys = []
+            for final_norm_key, runtime_norm_key in final_norm_key_pairs:
+                if final_norm_key in checkpoint_weights and runtime_norm_key not in checkpoint_weights:
+                    checkpoint_weights[runtime_norm_key] = checkpoint_weights[final_norm_key]
+                    remapped_norm_keys.append((final_norm_key, runtime_norm_key))
+            if remapped_norm_keys:
+                pretty_pairs = ", ".join(
+                    f"{src} -> {dst}" for src, dst in remapped_norm_keys
+                )
+                print(f"  [fix] phi3small stage1 load: remapped {pretty_pairs}")
+        print(f"Total weights in checkpoint: {len(checkpoint_weights)}")
+        
+        # Get weight naming pattern for this model
+        weight_pattern = get_weight_pattern(self.model_type)
+        print(f"Using weight pattern for: {self.model_type}")
+        
+        # Collect all parameters
+        params_dict = dict(self.named_parameters())
+        total_params = len(params_dict)
+        
+        loaded_keys = set()
+        loaded_count = 0
+        self._stage1_copy_profile_records.clear()
+        
+        # Load weights
+        with _nvtx_range("p2_stage1_param_scan_load"):
+            for param_name, param in params_dict.items():
+                # Option 1: Direct match
+                if param_name in checkpoint_weights:
+                    weight_loader = getattr(param, "weight_loader",
+                                           lambda p, w: p.data.copy_(w))
+                    with _nvtx_range("p2_stage1_direct_fetch_tensor"):
+                        with _nvtx_range("IO:fetch_tensor"):
+                            src_tensor = checkpoint_weights[param_name]
+                            self._stage1_touch_tensor_for_io(src_tensor)
+                    self._run_profiled_weight_loader(
+                        "p2_stage1_direct_weight_loader",
+                        param,
+                        src_tensor,
+                        weight_loader,
+                    )
+                    loaded_keys.add(param_name)
+                    loaded_count += 1
+                    continue
+                
+                # Option 2: Match without .layer prefix (for wrapped layers)
+                alt_name = param_name.replace(".layer.", ".")
+                if alt_name in checkpoint_weights:
+                    weight_loader = getattr(param, "weight_loader",
+                                           lambda p, w: p.data.copy_(w))
+                    with _nvtx_range("p2_stage1_alt_fetch_tensor"):
+                        with _nvtx_range("IO:fetch_tensor"):
+                            src_tensor = checkpoint_weights[alt_name]
+                            self._stage1_touch_tensor_for_io(src_tensor)
+                    self._run_profiled_weight_loader(
+                        "p2_stage1_alt_weight_loader",
+                        param,
+                        src_tensor,
+                        weight_loader,
+                    )
+                    loaded_keys.add(param_name)
+                    loaded_count += 1
+                    continue
+                
+                # Option 3: Fused QKV weights (범용)
+                if weight_pattern.qkv_fused_name and weight_pattern.qkv_fused_name in param_name:
+                    qkv_loaded = self._load_qkv_weights(
+                        param, param_name, checkpoint_weights, weight_pattern
+                    )
+                    if qkv_loaded:
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
+                # Option 4: Fused Gate-Up weights (범용)
+                if weight_pattern.mlp_fused_name and weight_pattern.mlp_fused_name in param_name:
+                    mlp_loaded = self._load_mlp_weights(
+                        param, param_name, checkpoint_weights, weight_pattern
+                    )
+                    if mlp_loaded:
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
+                # Option 5: Falcon HuggingFace 형식 변환
+                # vLLM param:    model.layers.N.layer.*   (ProgressiveModelDualPath 래핑)
+                # HF checkpoint: transformer.h.N.*         (Falcon 원본 형식)
+                if self.model_type == "falcon":
+                    import re
+                    falcon_name = re.sub(
+                        r'^model\.layers\.(\d+)\.layer\.',
+                        lambda m: f'transformer.h.{m.group(1)}.',
+                        param_name,
+                    )
+                    if falcon_name == param_name:
+                        # 레이어가 아닌 파라미터: embed_tokens, norm
+                        falcon_name = param_name \
+                            .replace("model.embed_tokens.", "transformer.word_embeddings.") \
+                            .replace("model.norm.", "transformer.ln_f.")
+                    if falcon_name != param_name and falcon_name in checkpoint_weights:
+                        weight_loader = getattr(param, "weight_loader",
+                                               lambda p, w: p.data.copy_(w))
+                        with _nvtx_range("p2_stage1_falcon_remap_fetch_tensor"):
+                            with _nvtx_range("IO:fetch_tensor"):
+                                src_tensor = checkpoint_weights[falcon_name]
+                                self._stage1_touch_tensor_for_io(src_tensor)
+                        self._run_profiled_weight_loader(
+                            "p2_stage1_falcon_remap_weight_loader",
+                            param,
+                            src_tensor,
+                            weight_loader,
+                        )
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
+        # Missing weights 처리
+        missing_keys = set(params_dict.keys()) - loaded_keys
+        
+        if missing_keys:
+            print(f"\n⚠️  Found {len(missing_keys)} missing weights")
+            print(f"   Initializing them to ZEROS (for inactive layers)...")
+            
+            # Layer별로 그룹화
+            missing_by_layer = {}
+            for key in missing_keys:
+                parts = key.split('.')
+                if len(parts) >= 4 and parts[0] == "model" and parts[1] == "layers":
+                    try:
+                        layer_idx = int(parts[2])
+                        if layer_idx not in missing_by_layer:
+                            missing_by_layer[layer_idx] = []
+                        missing_by_layer[layer_idx].append(key)
+                    except ValueError:
+                        pass
+            
+            # Layer별 초기화
+            zero_initialized = 0
+            for layer_idx in sorted(missing_by_layer.keys()):
+                layer_keys = missing_by_layer[layer_idx]
+                
+                if layer_idx in self.inactive_layer_indices:
+                    # Inactive layer: 0으로 초기화 (예상된 동작)
+                    print(f"   Layer {layer_idx}: Initializing {len(layer_keys)} weights to ZERO (inactive)")
+                    
+                    for key in layer_keys:
+                        param = params_dict[key]
+                        nn.init.zeros_(param)
+                        zero_initialized += 1
+                else:
+                    # Active layer인데 missing → 경고!
+                    print(f"   ⚠️  Layer {layer_idx}: Missing {len(layer_keys)} weights (ACTIVE layer!)")
+                    
+                    # 그래도 0으로 초기화 (에러 방지)
+                    for key in layer_keys:
+                        param = params_dict[key]
+                        nn.init.zeros_(param)
+                        zero_initialized += 1
+            
+            print(f"✅ Initialized {zero_initialized} missing weights to ZERO")
+
+        self._finalize_stage1_copy_profile()
+        
+        print(f"\n{'='*60}")
+        print(f"WEIGHT LOADING SUMMARY")
+        print(f"{'='*60}")
+        print(f"Total parameters:      {total_params}")
+        print(f"Loaded from checkpoint: {loaded_count}")
+        print(f"Initialized to zero:    {len(missing_keys)}")
+        print(f"Coverage:               {loaded_count / total_params * 100:.1f}%")
+        print(f"{'='*60}\n")
+    
+    def _load_qkv_weights(
+        self,
+        param,
+        param_name: str,
+        checkpoint_weights: dict[str, torch.Tensor],
+        weight_pattern: Any,
+    ) -> bool:
+        """범용 QKV weight 로딩"""
+        # Build expected weight names based on pattern
+        weight_names = []
+        
+        if ".layer." in param_name:
+            checkpoint_base = param_name.replace(f".layer.self_attn.{weight_pattern.qkv_fused_name}.weight", "")
+        else:
+            checkpoint_base = param_name.replace(f".self_attn.{weight_pattern.qkv_fused_name}.weight", "")
+        
+        for proj_name in weight_pattern.qkv_weights:
+            if "self_attn" in param_name:
+                weight_name = f"{checkpoint_base}.self_attn.{proj_name}.weight"
+            elif "attn" in param_name:
+                weight_name = f"{checkpoint_base}.attn.{proj_name}.weight"
+            else:
+                # Fallback
+                weight_name = f"{checkpoint_base}.{proj_name}.weight"
+            
+            weight_names.append(weight_name)
+        
+        # Check if all weights exist
+        if all(name in checkpoint_weights for name in weight_names):
+            with _nvtx_range("p2_stage1_qkv_cpu_fuse_cat"):
+                with _nvtx_range("IO:cpu_fuse_cat"):
+                    qkv_weight = torch.cat([
+                        checkpoint_weights[name] for name in weight_names
+                    ], dim=0)
+                self._stage1_touch_tensor_for_io(qkv_weight)
+            
+            weight_loader = getattr(param, "weight_loader",
+                                   lambda p, w: p.data.copy_(w))
+            self._run_profiled_weight_loader(
+                "p2_stage1_qkv_weight_loader",
+                param,
+                qkv_weight,
+                weight_loader,
+            )
+            return True
+        
+        return False
+    
+    def _load_mlp_weights(
+        self,
+        param,
+        param_name: str,
+        checkpoint_weights: Dict[str, torch.Tensor],
+        weight_pattern: Any,
+    ) -> bool:
+        """범용 MLP weight 로딩"""
+        if not weight_pattern.mlp_gate_up:
+            return False
+        
+        # Build expected weight names based on pattern
+        weight_names = []
+        
+        if ".layer." in param_name:
+            checkpoint_base = param_name.replace(f".layer.mlp.{weight_pattern.mlp_fused_name}.weight", "")
+        else:
+            checkpoint_base = param_name.replace(f".mlp.{weight_pattern.mlp_fused_name}.weight", "")
+        
+        for proj_name in weight_pattern.mlp_gate_up:
+            weight_name = f"{checkpoint_base}.mlp.{proj_name}.weight"
+            weight_names.append(weight_name)
+        
+        # Check if all weights exist
+        if all(name in checkpoint_weights for name in weight_names):
+            with _nvtx_range("p2_stage1_mlp_cpu_fuse_cat"):
+                with _nvtx_range("IO:cpu_fuse_cat"):
+                    mlp_weight = torch.cat([
+                        checkpoint_weights[name] for name in weight_names
+                    ], dim=0)
+                self._stage1_touch_tensor_for_io(mlp_weight)
+            
+            weight_loader = getattr(param, "weight_loader",
+                                   lambda p, w: p.data.copy_(w))
+            self._run_profiled_weight_loader(
+                "p2_stage1_mlp_weight_loader",
+                param,
+                mlp_weight,
+                weight_loader,
+            )
+            return True
+        
+        return False
+    
+    # ============================================================
+    # Progressive Recovery (Alpha Gating)
+    # ============================================================
+    
+    def _get_b_indices(self) -> List[int]:
+        if self.prune_info:
+            return list(self.prune_info['split']['B'])
+        num = self.config.num_hidden_layers
+        return list(range(int(num * 0.75), int(num * 0.88)))
+
+    def _get_c_indices(self) -> List[int]:
+        if self.prune_info:
+            return list(self.prune_info['split']['C'])
+        num = self.config.num_hidden_layers
+        return list(range(int(num * 0.88), num))
+
+    def get_recompute_boundary(self, newly_activated_indices: List[int]) -> Optional[int]:
+        """
+        Partial KV recomputation을 위한 boundary layer 계산.
+
+        Returns:
+            boundary layer index (이 레이어부터 full forward 필요)
+            None이면 partial recompute 불가 (전체 recompute)
+        """
+        if not newly_activated_indices:
+            return None
+
+        # Boundary = 새로 활성화된 레이어 중 최솟값
+        # 이 레이어부터 hidden states가 변경되므로 full forward 필요
+        boundary = min(newly_activated_indices)
+
+        if boundary <= 0:
+            return None  # 첫 레이어부터 변경 → full recompute
+
+        return boundary
+
+    def _get_max_cacheable_layer(self) -> Optional[int]:
+        """
+        현재 stage에서 캐싱할 최대 레이어 인덱스 반환.
+        다음 stage의 boundary-1을 반환.
+        """
+        if self.current_stage == 1:
+            # Stage 1: Stage 2 boundary-1까지만 캐싱
+            b_indices = self._get_b_indices()
+            if b_indices:
+                return min(b_indices) - 1
+        elif self.current_stage == 2:
+            # Stage 2: Stage 3 boundary-1까지만 캐싱
+            c_indices = self._get_c_indices()
+            if c_indices:
+                return min(c_indices) - 1
+        # Stage 3 or unknown: 모든 레이어 캐싱
+        return None
+
+    def prefetch_stage2(self, checkpoint_path: str) -> None:
+        """Stage 2 weights를 백그라운드에서 CPU에 미리 로드. Stage 1 서빙 시작 직후 호출."""
+        self.model.prefetch_weights(checkpoint_path, self._get_b_indices())
+
+    def prefetch_stage3(self, checkpoint_path: str) -> None:
+        """Stage 3 weights를 백그라운드에서 CPU에 미리 로드. Stage 2 서빙 시작 직후 호출."""
+        self.model.prefetch_weights(checkpoint_path, self._get_c_indices())
+
+    def advance_to_stage2_instant(self, wait_if_needed: bool = True) -> bool:
+        """
+        prefetch된 weights로 즉각 Stage 2 전환.
+        디스크 I/O 없이 GPU copy + alpha 변경만 실행.
+        prefetch_stage2()가 먼저 호출되어 있어야 함.
+
+        Partial KV recomputation: B 레이어들이 활성화되므로 boundary 설정
+        """
+        b_indices = self._get_b_indices()
+
+        success = self.model.activate_layers_instant(
+            b_indices,
+            wait_if_needed=wait_if_needed,
+            num_streams=self._instant_streams,
+        )
+
+        if success:
+            self.current_stage = 2
+            self.inactive_layer_indices = set(self._get_c_indices())
+
+            # 캐싱 범위 설정 (Stage 3 boundary-1까지)
+            max_cacheable = self._get_max_cacheable_layer()
+            if self._disable_persistent_cache_writes:
+                self.model._max_cacheable_layer = -1
+                print("[Stage2] Caching disabled (persistent writes OFF)")
+            else:
+                self.model._max_cacheable_layer = max_cacheable
+                if max_cacheable is not None:
+                    print(f"[Stage2] Caching layers 0-{max_cacheable} (Stage 3 준비)")
+
+            print(f"\n{'='*80}")
+            print(f"NOW AT STAGE 2 (instant)")
+            print(f"{'='*80}\n")
+            self.print_status()
+
+        return success
+
+    def advance_to_stage3_instant(self, wait_if_needed: bool = True) -> bool:
+        """
+        prefetch된 weights로 즉각 Stage 3 전환.
+        prefetch_stage3()가 먼저 호출되어 있어야 함.
+
+        Partial KV recomputation: C 레이어들이 활성화되므로 boundary 설정
+        """
+        c_indices = self._get_c_indices()
+
+        success = self.model.activate_layers_instant(
+            c_indices,
+            wait_if_needed=wait_if_needed,
+            num_streams=self._instant_streams,
+        )
+
+        if success:
+            self.current_stage = 3
+            self.inactive_layer_indices = set()
+
+            # 캐싱 범위 설정 (Stage 3는 모든 레이어)
+            if self._disable_persistent_cache_writes:
+                self.model._max_cacheable_layer = -1
+                print("[Stage3] Caching disabled (persistent writes OFF)")
+            else:
+                self.model._max_cacheable_layer = None
+                print(f"[Stage3] Caching all layers (final stage)")
+
+            print(f"\n{'='*80}")
+            print(f"NOW AT STAGE 3 - FULL MODEL (instant)")
+            print(f"{'='*80}\n")
+            self.print_status()
+
+        return success
+
+    def is_stage2_ready(self) -> bool:
+        """Stage 2 prefetch 완료 여부 (non-blocking 확인용)"""
+        return self.model.is_prefetch_ready()
+
+    def is_prefetch_ready(self) -> bool:
+        """최근 prefetch 완료 여부 (Stage 2/3 공통)"""
+        return self.model.is_prefetch_ready()
+
+    def wait_for_prefetch(self, timeout_s: Optional[float] = None) -> bool:
+        """최근 prefetch 완료까지 대기"""
+        return self.model.wait_for_prefetch(timeout_s=timeout_s)
+
+    def get_prefetch_status(self) -> dict:
+        """최근 prefetch 상태 반환"""
+        return self.model.get_prefetch_status()
+
+    def advance_to_stage2(
+        self,
+        layer_b_checkpoint: str,
+        adapter_ab_path: Optional[str] = None,
+    ) -> None:
+        """Stage 1 → Stage 2 (prune_log 기반)"""
+        print("\n" + "="*80)
+        print(f"ADVANCING TO STAGE 2 (Universal, {self.model_type})")
+        print("="*80)
+        
+        # prune_log에서 B 레이어 가져오기
+        if self.prune_info is None:
+            print("⚠️  Warning: No prune_log available. Using fallback.")
+            num_layers = self.config.num_hidden_layers
+            start = int(num_layers * 0.75)
+            end = int(num_layers * 0.88)
+            activate_indices = list(range(start, end))
+        else:
+            activate_indices = self.prune_info['split']['B']
+            print(f"Activating layers from prune_log: {activate_indices}")
+        
+        # B 레이어 활성화
+        self.model.activate_layers(
+            layer_indices=activate_indices,
+            checkpoint_path=layer_b_checkpoint,
+        )
+        
+        # Adapter (optional)
+        if adapter_ab_path:
+            print(f"Loading AB adapter from: {adapter_ab_path}")
+        
+        # Stage 업데이트
+        self.current_stage = 2
+        
+        # Inactive layers 업데이트 (C만)
+        if self.prune_info:
+            self.inactive_layer_indices = set(self.prune_info['split']['C'])
+        else:
+            num_layers = self.config.num_hidden_layers
+            start = int(num_layers * 0.88)
+            self.inactive_layer_indices = set(range(start, num_layers))
+        
+        print(f"\n{'='*80}")
+        print(f"NOW AT STAGE 2")
+        print(f"{'='*80}\n")
+        
+        self.print_status()
+    
+    def advance_to_stage3(
+        self,
+        layer_c_checkpoint: str,
+        remove_adapter: bool = True,
+    ) -> None:
+        """Stage 2 → Stage 3 (prune_log 기반)"""
+        print("\n" + "="*80)
+        print(f"ADVANCING TO STAGE 3 (Universal, {self.model_type})")
+        print("="*80)
+        
+        # prune_log에서 C 레이어 가져오기
+        if self.prune_info is None:
+            print("⚠️  Warning: No prune_log available. Using fallback.")
+            num_layers = self.config.num_hidden_layers
+            start = int(num_layers * 0.88)
+            activate_indices = list(range(start, num_layers))
+        else:
+            activate_indices = self.prune_info['split']['C']
+            print(f"Activating layers from prune_log: {activate_indices}")
+        
+        # C 레이어 활성화
+        self.model.activate_layers(
+            layer_indices=activate_indices,
+            checkpoint_path=layer_c_checkpoint,
+        )
+        
+        # Adapter 제거
+        if remove_adapter:
+            print("Removing all adapters...")
+        
+        # Stage 업데이트
+        self.current_stage = 3
+        self.inactive_layer_indices = set()  # 모두 활성
+        
+        print(f"\n{'='*80}")
+        print(f"NOW AT STAGE 3 - FULL MODEL")
+        print(f"{'='*80}\n")
+        
+        self.print_status()
+    
+    # ============================================================
+    # Status and Info Methods
+    # ============================================================
+    
+    def print_status(self) -> None:
+        """현재 모델 상태 출력"""
+        self.model.print_layer_status()
+        
+        print(f"Current Stage: {self.current_stage}")
+        print(f"Model Type: {self.model_type}")
+        
+        report = self.model.verify_recovery()
+        print(f"Activation Progress: {report['activation_progress']}")
+        
+        adapter_info = self.model.get_adapter_info()
+        print(f"Current Adapter: {adapter_info['current_adapter'] or 'None'}")
+        print()
+    
+    def get_stage_info(self) -> dict:
+        """현재 stage 정보 반환 (prune_info 포함)"""
+        report = self.model.verify_recovery()
+        adapter_info = self.model.get_adapter_info()
+        
+        return {
+            "stage": self.current_stage,
+            "model_type": self.model_type,
+            "active_layers": report["active_layers"],
+            "inactive_layers": report["inactive_layers"],
+            "activation_progress": report["activation_progress"],
+            "current_adapter": adapter_info["current_adapter"],
+            "inactive_layer_indices": report["inactive_layer_indices"],
+            "prune_info": self.prune_info,
+        }
+
+    def get_last_instant_activation_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_instant_activation_profile"):
+            return self.model.get_last_instant_activation_profile()
+        return None
+
+    def get_last_surgery_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_surgery_profile"):
+            return self.model.get_last_surgery_profile()
+        return None
+
+    def get_last_partial_recompute_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_partial_recompute_profile"):
+            return self.model.get_last_partial_recompute_profile()
+        return None
+    
+    def get_layer_alphas(self) -> List[float]:
+        """모든 레이어의 alpha 값 반환"""
+        alphas = []
+        for layer in self.model.layers:
+            if hasattr(layer, 'get_alpha_value'):
+                alphas.append(layer.get_alpha_value())
+            else:
+                alphas.append(1.0)  # Normal layer
+        return alphas
+    
+    def set_layer_alpha(self, layer_idx: int, alpha: float):
+        """특정 레이어의 alpha 값 직접 설정"""
+        if layer_idx >= len(self.model.layers):
+            raise ValueError(f"Invalid layer index: {layer_idx}")
+        
+        layer = self.model.layers[layer_idx]
+        if hasattr(layer, 'set_alpha'):
+            layer.set_alpha(alpha) 
+            print(f"Layer {layer_idx} alpha set to {alpha}")
+        else:
+            print(f"Layer {layer_idx} is not an AlphaGatedLayer")

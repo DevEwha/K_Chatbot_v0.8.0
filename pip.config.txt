@@ -1,0 +1,5 @@
+For variant 'global', will try loading '/etc/xdg/pip/pip.conf'
+For variant 'global', will try loading '/etc/pip.conf'
+For variant 'user', will try loading '/home/devewha/.pip/pip.conf'
+For variant 'user', will try loading '/home/devewha/.config/pip/pip.conf'
+For variant 'site', will try loading '/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/venv/pip.conf'

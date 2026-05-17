@@ -1,0 +1,2 @@
+model,repair_oracle_B_x,stale_oracle_B_x,repair_oracle_C_x,stale_oracle_C_x,repair_cost_tmax_us_per_token,fast_path_success_pct,post_promo_gain_tmax_x,tmax
+Falcon-7B,,,,,91.19,100.0,4.49,1487

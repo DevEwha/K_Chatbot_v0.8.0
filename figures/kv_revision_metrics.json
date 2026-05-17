@@ -1,0 +1,130 @@
+[
+  {
+    "model": "llama2-7b",
+    "display_name": "LLaMA-2-7B",
+    "repair_delta_B": -0.1679,
+    "stale_delta_B": 1.7357,
+    "repair_delta_C": 0.0212,
+    "stale_delta_C": 3.8734,
+    "oracle_B": 18.6435,
+    "oracle_C": 11.5058,
+    "repair_B": 18.4756,
+    "repair_C": 11.527,
+    "stale_B": 20.3792,
+    "stale_C": 15.3791,
+    "stage_1to2": {
+      "tmax": 1500,
+      "origin_ttft_ms": 227.7,
+      "repair_ttft_ms": 56.7,
+      "ttft_saved_ms": 171.0,
+      "ttft_speedup_x": 4.02,
+      "repair_overhead_us_per_token": 95.8,
+      "fast_path_success_pct": 100.0
+    },
+    "stage_2to3": {
+      "tmax": 1500,
+      "origin_ttft_ms": 228.5,
+      "repair_ttft_ms": 54.4,
+      "ttft_saved_ms": 174.1,
+      "ttft_speedup_x": 4.2,
+      "repair_overhead_us_per_token": 71.8,
+      "fast_path_success_pct": 100.0
+    }
+  },
+  {
+    "model": "falcon-7b",
+    "display_name": "Falcon-7B",
+    "repair_delta_B": -0.4981,
+    "stale_delta_B": 1.0758,
+    "repair_delta_C": 0.6033,
+    "stale_delta_C": 6.7887,
+    "oracle_B": 36.924,
+    "oracle_C": 22.4482,
+    "repair_B": 36.4259,
+    "repair_C": 23.0516,
+    "stale_B": 37.9998,
+    "stale_C": 29.2369,
+    "stage_1to2": {
+      "tmax": 1487,
+      "origin_ttft_ms": 232.8,
+      "repair_ttft_ms": 59.5,
+      "ttft_saved_ms": 173.3,
+      "ttft_speedup_x": 3.91,
+      "repair_overhead_us_per_token": 89.6436,
+      "fast_path_success_pct": 100.0
+    },
+    "stage_2to3": {
+      "tmax": 1487,
+      "origin_ttft_ms": 234.0,
+      "repair_ttft_ms": 53.4,
+      "ttft_saved_ms": 180.6,
+      "ttft_speedup_x": 4.38,
+      "repair_overhead_us_per_token": 78.4802,
+      "fast_path_success_pct": 100.0
+    }
+  },
+  {
+    "model": "gemma-7b",
+    "display_name": "Gemma-7B",
+    "repair_delta_B": 0.0802,
+    "stale_delta_B": 2.7582,
+    "repair_delta_C": 0.1157,
+    "stale_delta_C": 4.9098,
+    "oracle_B": 21.4515,
+    "oracle_C": 15.9591,
+    "repair_B": 21.5317,
+    "repair_C": 16.0748,
+    "stale_B": 24.2097,
+    "stale_C": 20.8689,
+    "stage_1to2": {
+      "tmax": 1483,
+      "origin_ttft_ms": 270.8,
+      "repair_ttft_ms": 66.2,
+      "ttft_saved_ms": 204.6,
+      "ttft_speedup_x": 4.09,
+      "repair_overhead_us_per_token": 214.0256,
+      "fast_path_success_pct": 100.0
+    },
+    "stage_2to3": {
+      "tmax": 1483,
+      "origin_ttft_ms": 273.1,
+      "repair_ttft_ms": 65.3,
+      "ttft_saved_ms": 207.8,
+      "ttft_speedup_x": 4.18,
+      "repair_overhead_us_per_token": 199.056,
+      "fast_path_success_pct": 100.0
+    }
+  },
+  {
+    "model": "llama2-13b",
+    "display_name": "LLaMA-2-13B",
+    "repair_delta_B": -0.1155,
+    "stale_delta_B": 1.0295,
+    "repair_delta_C": 0.1,
+    "stale_delta_C": 1.4258,
+    "oracle_B": 14.2352,
+    "oracle_C": 10.0509,
+    "repair_B": 14.1198,
+    "repair_C": 10.1508,
+    "stale_B": 15.2647,
+    "stale_C": 11.4767,
+    "stage_1to2": {
+      "tmax": 1500,
+      "origin_ttft_ms": 410.8,
+      "repair_ttft_ms": 89.1,
+      "ttft_saved_ms": 321.7,
+      "ttft_speedup_x": 4.61,
+      "repair_overhead_us_per_token": 137.4,
+      "fast_path_success_pct": 100.0
+    },
+    "stage_2to3": {
+      "tmax": 1500,
+      "origin_ttft_ms": 415.6,
+      "repair_ttft_ms": 89.0,
+      "ttft_saved_ms": 326.6,
+      "ttft_speedup_x": 4.67,
+      "repair_overhead_us_per_token": 109.0667,
+      "fast_path_success_pct": 100.0
+    }
+  }
+]

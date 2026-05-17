@@ -1,0 +1,977 @@
+% use the base acmart.cls
+% use the sigplan proceeding template with the default 10 pt fonts
+% nonacm option removes ACM related text in the submission. 
+
+
+\documentclass[sigplan,anonymous,review,nonacm]{acmart}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{subcaption}
+% enable page numbers
+\settopmatter{printfolios=true}
+\usepackage{makecell}
+\setlength{\textfloatsep}{8pt plus 2pt minus 2pt}
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\intextsep}{6pt plus 2pt minus 2pt}
+\usepackage[skip=5pt]{caption}
+\usepackage{placeins}
+\begin{document}
+\title{ProgressiveServe: Replay-Safe Progressive Model Recovery for Serverless LLM Serving}
+
+\begin{abstract}
+Serverless LLM cold starts are traditionally all-or-nothing: requests cannot be served until the full model checkpoint is fetched, restored, and initialized. We present ProgressiveServe, a system that reformulates serverless LLM cold start as progressive recovery under partial model availability. The system begins serving from the earliest executable Stage~1 and progressively recovers model capacity through later stages during online serving. The challenge is that promoting later layers during live serving can invalidate both the CUDA execution graph and the KV cache accumulated under earlier, lower-capacity layer segments. ProgressiveServe addresses these challenges with two mechanisms: (1) virtual-layer-based stage promotion that swaps layer weights in place without rebuilding the CUDA execution graph, and (2) boundary-aware KV cache repair that identifies which cache entries remain valid and recomputes only the rest. An offline stage preparation pipeline constructs the executable Stage~1 base and later recovery stages that are directly compatible with virtual-layer promotion and KV cache repair at runtime. Across serverless serving experiments, ProgressiveServe reduces time-to-first-token (TTFT) by 26.1--32.4\% relative to full-model wait, while later stages recover quality close to the baseline, with bounded promotion overhead during live serving.
+\end{abstract}
+
+\maketitle % should come after the abstract
+
+% 1. Introduction (자동 번호 1)
+\section{Introduction}
+Large language models (LLMs) are increasingly deployed in serverless environments to provide elastic and on-demand inference~\cite{serverlessllm, deepserve, hydraserve}. However, current serverless LLM serving remains fundamentally constrained by \emph{all-or-nothing model readiness}: inference cannot begin until the entire model checkpoint has been fetched, restored, and initialized~\cite{serverlessllm, hydraserve}. Cold-start latency is a well-known performance bottleneck in serverless systems~\cite{fork2025coldstart}. This issue is particularly severe for LLMs, whose large model weights incur significant fetching and loading overhead during initialization~\cite{serverlessllm, hydraserve, lscale}. As model sizes grow, cold-start latency can reach tens to hundreds of seconds, delaying the first user-visible response~\cite{serverlessllm, hydraserve}. Because serverless instances are frequently restarted, this penalty is not a one-time cost but a recurring overhead that compounds with scale.
+
+A straightforward approach is to start serving before the full model is ready by executing only the locally available layers. However, this approach conflicts with the execution model of CUDA graph capture and replay, which reduce overhead by reusing a fixed sequence of GPU operations~\cite{nvidia_cuda_graphs}. Because CUDA graphs capture a fixed execution topology, structural changes render the graph out of date and require re-capture~\cite{nvidia_cuda_graphs}. More critically, even when a stage promotion does not trigger recapture, the runtime may silently replay a stale graph whose computation no longer matches the updated model, producing incorrect outputs without raising an error. A second problem arises from the KV (Key-Value) cache; once additional layers become active, previously cached states are no longer semantically consistent with the promoted model, and because KV entries are reused across decoding steps, such inconsistencies propagate through generation.
+
+Recent works have actively explored reducing cold-start latency in LLM serving systems, primarily focusing on accelerating model initialization or reusing previously materialized state~\cite{serverlessllm, deepserve, hydraserve, lscale}. However, these approaches fundamentally assume that inference begins only after the full model becomes available. As a result, they do not support execution under partial model availability, nor do they address the challenges of maintaining execution stability and cache correctness during dynamic model evolution.
+
+Our key insight is that model readiness need not be a binary condition: an LLM can begin serving with only a subset of its layers active, then progressively recover full capacity as remaining layers arrive. Figure~\ref{fig:intro-coldstart} summarizes this shift from all-or-nothing readiness to progressive availability. Existing serving stacks prevent this because they tightly couple the execution graph to the full weight set; a partially loaded model simply cannot run. Breaking this coupling introduces two correctness challenges: the CUDA execution graph must remain stable across stage promotions, and KV cache entries produced by earlier, lower-capacity layer segments must be repaired when later ones come online.
+
+To address these challenges, we present \textbf{ProgressiveServe}, a serverless LLM serving system that progressively recovers model capacity while preserving execution correctness. The key idea is to maintain a full-depth model skeleton throughout execution, regardless of how many layers have been recovered. When a layer's weights have not yet arrived, ProgressiveServe binds that slot to a \textit{virtual layer}, which is a lightweight identity operator that preserves the graph structure while semantically behaving as an identity and preserving a fixed operator schedule. This behavior is realized through a gating mechanism that switches between identity and full computation without introducing control-flow changes. As weights arrive, the virtual layer is replaced in place with the real layer, requiring no graph rebuild. 
+
+Progressive recovery also requires cache correctness. We refer to the boundary between already-active and newly-recovered layers as the promotion point. When later layers become active, they change the model's computation path, invalidating KV states that were cached under the earlier, lower-capacity configuration. ProgressiveServe leverages the promotion point to identify which cache entries remain valid and recomputes only the affected portion, avoiding a full recomputation while preserving correctness.
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.97\columnwidth]{figure1}
+\caption{
+Baseline serverless LLM serving waits for the full model before emitting any token. ProgressiveServe instead begins serving from Stage~1 and overlaps the remaining recovery with background restoration.
+}
+\label{fig:intro-coldstart}
+\end{figure}
+
+We implement ProgressiveServe on modern LLM serving stacks and evaluate it across multiple models and workloads. Our results show that ProgressiveServe reduces time-to-first-token (TTFT) by up to 32.4\%, significantly improving startup availability while preserving output quality and replay-safe execution during stage promotions. We further show that continued CUDA-graph replay without recapture does not by itself guarantee correctness, motivating the transition invariants enforced by ProgressiveServe.
+
+Figure~\ref{fig:system-overview} summarizes the overall ProgressiveServe workflow, including offline stage preparation, online in-place promotion, and boundary-aware KV cache repair.
+
+In summary, this paper makes the following contributions:
+\begin{itemize}
+    \item We formulate serverless LLM cold start as a progressive recovery problem and identify the tight coupling between execution structure and weight availability as the key barrier to partial model execution.
+    \item We present ProgressiveServe, which maintains a full-depth model skeleton using virtual layers and promotes stages in place without rebuilding the execution graph. To preserve KV cache correctness across promotions, ProgressiveServe identifies valid cache entries via the promotion point and recomputes only the affected portion.
+    \item We evaluate ProgressiveServe on four models from three families (LLaMA-2, Falcon, and Gemma) on a vLLM-based serving stack. ProgressiveServe reduces time-to-first-token (TTFT) by 26.1--32.4\% relative to full-model loading, while later stages recover quality close to the fully recovered model with bounded promotion overhead.
+\end{itemize}
+
+% 2.  Background or System Design (자동 번호 2)
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{figure2}
+\caption{
+ProgressiveServe overview. Offline preparation constructs Segment~A as the executable Stage~1 base and Segments~B, C as ordered recovery segments. At runtime, deferred segments are asynchronously loaded and promoted in place, with KV cache repaired only beyond the promotion point. The execution skeleton remains fixed across all stages.
+}
+\label{fig:system-overview}
+\end{figure*}
+
+\section{Background and Motivation}
+
+\subsection{Autoregressive LLM Serving}
+Modern LLM serving follows a two-phase execution model of prefill and decode~\cite{vllm_sosp23}. During prefill, the serving engine processes all prompt tokens in parallel to produce the first output token. During decode, it iteratively consumes the previously generated token to produce the next, reusing per-layer KV states accumulated from prior steps~\cite{vllm_sosp23}. These cached states are central to serving performance: they eliminate redundant prefix recomputation on each decode step, directly affecting both TTFT and steady-state per-token latency.
+
+\subsection{Cold Start in Serverless LLM Serving}
+In a serverless deployment, an inference request may arrive at an instance that does not yet host the target model. A cold-started worker must therefore fetch checkpoint shards from remote or nearby storage, transfer them through host-side resources, initialize the runtime, and make the model ready for inference. Recent systems have substantially shortened this path via locality-aware checkpoint placement, faster loading pipelines, and efficient scale-out mechanisms ~\cite{serverlessllm,deepserve}. However, they still treat model readiness as an all-or-nothing condition: inference begins only after the worker materializes a serving-ready model instance. This assumption is natural in conventional serving stacks because the execution engine expects a semantically stable model before it begins serving interactive requests.
+
+\subsection{CUDA Graph Replay and Its Correctness Assumption}
+Modern LLM serving engines aggressively optimize the decode path because even small per-step overheads accumulate across long generations. A key technique is CUDA graph capture and replay: the engine records the decode computation once and relaunches it on each step with minimal host overhead, avoiding repeated kernel launches ~\cite{vllm_sosp23,vllm_cudagraph_docs,vllm_opt_levels,nvidia_cuda_graphs}. This works well when the model structure remains fixed, which is the common case in conventional serving. However, CUDA graph replay only guarantees that the same sequence of operations is executed; it does not verify that the captured computation still matches the current model state. If layers are added or replaced between captures, the runtime will silently replay a stale graph without raising an error, producing incorrect outputs. 
+
+\subsection{Cache Reuse and State Correctness}
+LLM serving also depends on semantic consistency between cached state and model parameters. Prefix caching and related state-reuse mechanisms can skip redundant prefill work when a new request shares a processed prefix ~\cite{vllm_prefix_docs}, and recent systems such as HCache ~\cite{hcache_eurosys25} and CacheBlend ~\cite{cacheblend_eurosys25} further optimize how cached state is stored, recovered, and partially recomputed. However, these techniques assume that the cached states remain compatible with the model that will consume them. If the model changes after a prefix has been processed, cached states beyond the first changed layer may no longer correspond to the representations that the updated model would have produced.
+
+\subsection{Why Partial Model Readiness Is Unsupported Today}
+These two properties---stable decode execution and cache compatibility---make model readiness effectively binary in existing systems. Activating layers mid-serving violates both; it disrupts the captured execution graph and invalidates KV states produced under the earlier configuration. Partial model availability is therefore not merely a checkpoint-loading problem but a problem of execution stability and cache correctness. This observation motivates our design goal: enabling progressive model recovery without mutating the decode structure or invalidating reusable cache state.
+
+
+% 3.Design
+\section{ProgressiveServe: Design Overview}
+\label{sec:design_overview}
+
+\paragraph{Problem and goal.}
+ProgressiveServe addresses the all-or-nothing cold start of serverless LLM serving by enabling \emph{progressive recovery}: the system begins serving from a partially loaded model and recovers full capacity as remaining layers arrive, without interrupting service or compromising CUDA-graph replay correctness and cache consistency.
+
+\paragraph{Core idea.}
+ProgressiveServe separates two concerns: \emph{structure preservation} and \emph{state repair}. For structure preservation, ProgressiveServe maintains a full-depth model skeleton throughout execution. Unloaded layers are bound to \emph{virtual layers}, identity operators that hold the slot without performing computation, so the CUDA graph always sees the same topology regardless of recovery progress. Stage promotion then reduces to swapping the tensor state within a fixed slot, requiring no graph rebuild. For state repair, ProgressiveServe leverages the promotion point to identify which KV cache entries remain valid and recomputes only the affected portion, avoiding a full cache rebuild.
+
+\paragraph{Offline preparation.}
+The offline phase prepares the model for progressive recovery. Using layer-similarity analysis, we identify a contiguous block of intermediate layers that can be initially replaced by virtual layers with minimal quality loss. The remaining layers, which typically form a disconnected prefix and suffix of the model, constitute Segment A---the executable Stage~1 base. The block itself is split into two ordered segments: Segment B and Segment C. During serving, each segment is activated by \emph{promoting} its virtual layers to real layers---swapping in the actual weights and flipping the gate from identity to active. Stage~2 promotes Segment B while Segment C remains virtual, and Stage~3 promotes Segment C to complete full model recovery. Each segment undergoes lightweight parameter adaptation offline on the same full-depth virtual-layer skeleton used at runtime, compensating for the capacity loss of the virtualized layers.
+
+\paragraph{Online progressive recovery.}
+The system begins to serve from Stage~1, with unrecovered layers bound to virtual layers. As each recovery segment arrives, ProgressiveServe swaps the virtual layers with real weights in place, preserving the CUDA graph topology without rebuilding~\cite{nvidia_cuda_graphs}. After each promotion, the runtime uses the promotion point---defined as the structural boundary between the already-active layers and the newly recovered layers---to determine which KV cache entries are still valid and recomputes only the rest.
+
+Section~\ref{sec:offline_preparation} covers offline stage preparation, Section~\ref{sec:cuda_stable_transition} describes virtual-layer-based stage promotion, and Section~\ref{sec:kv_repair} presents boundary-aware KV cache repair.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figure4}
+\caption{
+Why naive partial execution is unsafe under CUDA-graph replay.
+Left: partial graph becomes semantically mismatched after promotion.
+Right: ProgressiveServe preserves a fixed skeleton, enabling replay-safe execution.
+}
+\label{fig:graph-invariant}
+\end{figure}
+
+% 6. pruning&LoRA 
+\section{Offline Stage Preparation}
+\label{sec:offline_preparation}
+
+Before progressive recovery can occur online, the model must be prepared offline in a form that is executable under partial weight availability and directly compatible with the virtual-layer skeleton. Our goal is not permanent model compression, but constructing a \emph{stageable recovery form}: an early executable base together with ordered recovery stages that can be progressively promoted during serving.
+
+\paragraph{Pruning criterion.}
+To determine which layers can be initially replaced by virtual layers with minimal quality loss, we measure the angular distance between hidden representations entering layers $\ell$ and $\ell+n$ for a target block size $n$ (the number of contiguous layers to be replaced by virtual layers)~\cite{gromov2024deeperlayers}:
+\begin{equation}
+d\!\left(x^{(\ell)}, x^{(\ell+n)}\right)
+=
+\frac{1}{\pi}
+\arccos\!\left(
+\frac{x_T^{(\ell)} \cdot x_T^{(\ell+n)}}
+{\|x_T^{(\ell)}\|_2 \, \|x_T^{(\ell+n)}\|_2}
+\right),
+\end{equation}
+where $x_T^{(\ell)}$ denotes the final-token hidden state at layer $\ell$. We select the contiguous block that minimizes this boundary mismatch. Intuitively, the selected block contains the layers whose removal introduces the least representational discontinuity at the promotion point. Additional calibration details are provided in the appendix.
+
+\paragraph{Stage decomposition.}
+Unlike conventional pruning that permanently discards removed layers, ProgressiveServe preserves the selected block as ordered recovery segments for later promotion. Stage~1 serves Segment A with Segments B and C bound to virtual layers. At Stage~2, the system promotes Segment B while Segment C remains virtual. Finally, at Stage~3, the system promotes Segment C to complete full model recovery.
+
+\paragraph{Stagewise LoRA adaptation.}
+To perform the parameter adaptation mentioned in Section~\ref{sec:design_overview}, we utilize Low-Rank Adaptation (LoRA) ~\cite{lora} and train it on the SQuAD~\cite{rajpurkar-etal-2016-squad} dataset. Offline adaptation is performed on the same full-depth virtual-layer skeleton used at runtime, ensuring no topology mismatch between training and serving. We adapt each segment cumulatively: Segment A is adapted while Segments B and C remain virtual. Then, Segment B is promoted and its newly introduced layers are adapted, and finally Segment C follows the same pattern. At every stage, previously recovered layers remain merged and fixed, so model capacity grows monotonically. After each stage, the learned LoRA weights are merged into the base parameters, so that stage promotion at runtime changes only tensor state without altering module structure.
+
+% 4. CUDA 
+\section{Stage Promotion via Virtual Layers}
+
+\label{sec:cuda_stable_transition}
+
+Progressive serving requires stage promotion during live serving. The challenge is not simply that changing the model may invalidate a captured CUDA graph. More critically, the runtime can continue replaying a stale graph without error, silently producing incorrect outputs (we confirm this empirically in Section~\ref{sec:eval-graph-replay}). 
+Figure~\ref{fig:graph-invariant} illustrates this failure mode: a graph captured for a partial model can become semantically mismatched when later layers are activated, even if replay continues without an explicit recapture error.
+Our goal is therefore a promotion mechanism that recovers stages without interrupting service, while guaranteeing that the replayed execution always reflects the current model state.
+
+
+
+\paragraph{Virtual-layer execution model.}
+Let $M_s$ denote the model at recovery stage $s$. ProgressiveServe preserves a full-depth execution skeleton across all stages and expresses stage evolution purely through tensor state. For each layer $l$, a fixed virtual-layer slot owns preallocated parameter storage $W_l$ and a binary gate $\alpha_l \in \{0,1\}$. Given the hidden state $h_l$ at layer $l$, decode computes
+\begin{equation}
+h_{l+1} = \alpha_l F_l(h_l; W_l) + (1 - \alpha_l) h_l,
+\end{equation}
+where $F_l$ is the original layer transform. When $\alpha_l = 0$, the slot reduces to an identity operator and the output is independent of $W_l$. We call this configuration a \emph{virtual layer}: it occupies the same graph position, tensor shapes, and buffer allocations as a real layer, but contributes no computation to the forward pass. When $\alpha_l = 1$, the layer performs its full computation.
+
+The critical property of this design is that $\alpha_l$, $W_l$, and the layer's activation tensors all reside in preallocated, shape-invariant buffers within a fixed slot. Promoting a layer from virtual to real therefore changes only the numerical content of these buffers; the graph topology, tensor shapes, operator sequence, and invocation order remain identical. This matches the conditions under which CUDA graph replay remains valid: the runtime re-launches the same captured kernel sequence over updated data while preserving execution structure and tensor shapes~\cite{nvidia_cuda_graphs}. No graph recapture, no host-side control-flow divergence, and no operator re-scheduling is required at promotion time.
+
+This invariant is stronger than simply avoiding graph invalidation. Even when a naive approach avoids explicit recapture errors, the runtime can silently replay a graph whose computation no longer reflects the current model state. ProgressiveServe eliminates this class of errors by construction: because the graph structure is never mutated, the replayed execution at any stage $s$ produces the same layer-wise computation, up to numerical tolerance, as eager execution of $M_s$. We refer to this property as \emph{semantic alignment}: at each recovery stage, graph replay matches eager execution of the same stage up to numerical tolerance. In our evaluated configurations, any numerical variance introduced by the identity path remained within floating-point tolerance and did not measurably affect output quality or graph stability.
+
+\paragraph{Replay-safety invariants.}
+ProgressiveServe enforces four invariants during stage promotion.
+\begin{enumerate}
+    \item \textbf{Fixed layer schedule.} Layer count, order, and tensor shapes are fixed across stages.
+    \item \textbf{Dual-path evaluation.} Every layer always evaluates both the transform path $F_l(h_l; W_l)$ and the identity path $h_l$, regardless of whether the layer is active. This prevents promotion from adding or removing operators in the captured graph.
+    \item \textbf{Tensor-only routing.} Stage selection is expressed solely through the gate $\alpha_l$, never through host-side control flow. If host-side branching were used, a graph captured under one branch outcome would silently persist that decision after promotion, even though the intended computation has changed.
+    \item \textbf{In-place state update.} Each virtual-layer slot retains the same parameter buffers and bindings across stages; promotion mutates only tensor contents via operations such as \texttt{copy\_} and \texttt{fill\_}, never by replacing modules or editing graph structure.
+\end{enumerate}
+
+\paragraph{Two-phase transition protocol.}
+The invariants above specify \emph{what} must remain stable, but not \emph{when} weights become visible to replay. Because the dual-path design always evaluates the transform path, the runtime reads live layer storage even when $\alpha_l = 0$. Writing weights directly into live buffers would let in-flight replay observe a partially updated layer. ProgressiveServe avoids this with a two-phase protocol that makes promotion visible only at decode-step boundaries.
+
+\emph{(1) Prepare phase.}
+The system asynchronously fetches the target checkpoint shards to host memory and transfers the target-layer tensors to device-side staging buffers separate from live decode storage. This work overlaps with ongoing serving and does not alter the live decode template.
+
+\emph{(2) Commit phase.}
+Once the current decode step reaches a quiescent boundary, the decode stream waits for the staged transfers to complete, applies in-place copies from the staging buffers into the preallocated live slots of the target layers, and only then flips the corresponding gates $\alpha_l : 0 \rightarrow 1$. Gate updates are the last operation in the commit path.
+
+This ordering is critical. Exposing the gate before the weight copy completes would allow replay to observe a partially promoted stage. Copying directly into live storage without a commit boundary would let in-flight replay race with weight mutation. By making promotion visible only at step boundaries, ProgressiveServe ensures that each decode step observes either the pre-promotion or the post-promotion model, but never a mixed intermediate state.
+
+\paragraph{Overheads and trade-off.}
+Always evaluating both the transform and identity paths introduces extra arithmetic relative to ideal branch skipping, and two-phase promotion adds an explicit bounded data-movement step. These costs are acceptable because they buy a stronger property: replay-safe execution under dynamic model evolution. Structural branching can reduce arithmetic in the short term, but it turns promotion into a graph-visible event and risks silent semantic drift under continued replay. ProgressiveServe instead makes the transition cost explicit and bounded, while keeping the decode path correct across promotions.
+
+Stage promotion preserves the decode graph but does not guarantee that previously cached KV states remain compatible with the promoted model. Next section addresses this orthogonal concern by repairing stale cache entries produced under earlier stages.
+
+
+% 5. KV Cache
+\section{Boundary-Aware KV Cache Repair across Stage Promotions}
+\label{sec:kv_repair}
+
+After stage promotion, the conversation context remains valid but KV states cached under the earlier configuration are no longer compatible with the promoted model. A naive fix is to evict all cached blocks and let the next request perform a full prefill. This is correct but shifts a large recomputation penalty to the first post-promotion interaction.
+
+\paragraph{Boundary-based correctness criterion.}
+Let $\Delta_s$ be the set of layers whose parameters change at promotion $s\!\rightarrow\!s{+}1$, and define the promotion point as
+\begin{equation}
+b = \min \Delta_s .
+\end{equation}
+Let $h^{s}_{l,t}$ denote the hidden state at layer $l$, token position $t$, and stage $s$, and let $W^{s}_l$ denote the parameters of layer $l$ at stage $s$. For any token position $t$, post-promotion KV consistency requires
+\begin{equation}
+(K^{s+1}_{l,t},V^{s+1}_{l,t}) =
+\begin{cases}
+(K^{s}_{l,t},V^{s}_{l,t}), & l < b,\\
+F_l(h^{s+1}_{l-1,t}; W^{s+1}_l), & l \ge b.
+\end{cases}
+\label{eq:kv_boundary_rule}
+\end{equation}
+Layers before the promotion point are unchanged across stages, so their cached KV states can be reused directly. Layers at or beyond the promotion point either execute with changed weights or receive changed inputs, so their KV states must be recomputed under the promoted model. Figure~\ref{fig:kv-repair-concept} illustrates this rule at Stage~1$\rightarrow$Stage~2: although Stage~1 contains an active upper suffix, promoting the first deferred segment changes hidden states from layer $b$ onward, making the entire later-layer suffix stale rather than only the newly activated segment itself.
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.27\columnwidth}
+    \centering
+    \includegraphics[width=\textwidth]{kv_figure-a.pdf}
+    \caption{}
+\end{subfigure}
+\begin{subfigure}[t]{0.34\columnwidth}
+    \centering
+    \includegraphics[width=\textwidth]{kv_figure-b.pdf}
+    \caption{}
+\end{subfigure}
+\begin{subfigure}[t]{0.34\columnwidth}
+    \centering
+    \includegraphics[width=\textwidth]{kv_figure-c.pdf}
+    \caption{}
+\end{subfigure}
+\caption{KV cache repair at Stage~1$\rightarrow$2 promotion. (a)~Stage~1 skeleton with Segments~B and~C virtual. (b)~KV states before promotion point $b$ remain valid; those beyond $b$ become stale. (c)~Only the stale entries are recomputed in place from cached state at layer $b{-}1$.}
+\label{fig:kv-repair-concept}
+\end{figure}
+
+\paragraph{Prefix-preserving rematerialization.}
+Rather than evicting all cached state, ProgressiveServe repairs only the KV entries at and beyond the promotion point. As shown in Figure~\ref{fig:kv-repair-concept}(c), the runtime starts from the cached hidden state at layer $b{-}1$, re-executes layers $b, \ldots, L{-}1$ under the post-promotion weights, and writes the repaired KV states back into the same physical cache slots. KV states before the promotion point remain untouched. On the common fast path, this update preserves prefix-cache mapping, so subsequent requests retain prefix hits instead of paying a full-prefix miss. Appendix~\ref{app:vllm-prefix-cache} details the concrete slot-mapping integration with vLLM's prefix cache.
+
+\paragraph{Failure-safe fallback.}
+If these preconditions are not satisfied, such as missing block metadata or insufficient saved activations, ProgressiveServe falls back to a correctness-first path: it clears the prefix cache and runs a single eager prefill over the current conversation. Layers before the promotion point execute only the minimal KV-only work needed to regenerate their entries, whereas layers at and beyond the promotion point execute full forward passes. This fallback is one-shot; subsequent steps resume normal decode.
+
+\paragraph{Cost perspective.}
+A full cache reset recomputes all $L$ layers over the entire context. Prefix-preserving rematerialization recomputes only layers $b$ through $L{-}1$, skipping all layers before the promotion point. The fallback path additionally regenerates KV entries for layers before $b$, but uses a lightweight KV-only pass substantially cheaper than full forward execution. In both cases, repair cost scales with the number of changed layers rather than total model depth.
+
+
+%\paragraph{System implication.}
+%This design is complementary to Section~\ref{sec:cuda_stable_transition}: stage promotion keeps decode structure stable, and KV rematerialization recovers cache correctness without decode-template mutation.
+%We evaluate transition-time decomposition and user-visible latency with
+%\begin{equation}
+%T_{\text{effective}} = T_{\text{transition}} + T_{\text{first-chat}},
+%\end{equation}
+%using the benchmark pipeline in Section~\ref{sec:eval}.
+
+
+% 7. Evaluation 
+\section{Evaluation}
+
+We evaluate ProgressiveServe along five questions: (1) wheth-er progressive serving shortens startup time to first usability, (2) how model quality evolves as later stages are recovered, (3) whether CUDA graph replay remains semantically correct under model evolution, (4) whether stage promotion can be integrated into live serving without destabilizing latency or throughput, and (5) what correctness and runtime costs arise from post-promotion KV handling.
+
+
+\subsection{System Setup}
+\label{sec:system-setup}
+
+\paragraph{Hardware and software.}
+All experiments are conducted on a server running Ubuntu 24.04.4 LTS (kernel 6.8.0-88-generic) with dual-socket AMD EPYC 7763 processors (128 CPU cores total) and 1.0\,TiB of system memory. The machine is equipped with 7 NVIDIA RTX A6000 GPUs (driver version 560.35.03). Model checkpoints are stored on a remote NFS server (NFSv4) backed by NVMe storage, connected via a 20\,Gbps bonded Ethernet link (2$\times$10\,GbE, XOR mode). Unless otherwise specified, each experiment is conducted on a single RTX A6000 GPU. Our prototype is implemented on top of a vLLM-based serving stack using Python 3.12.3, PyTorch 2.6.0+cu124~\cite{pytorch2}, and vLLM 0.8.1.dev1+gf22103f58.
+
+\paragraph{Serving configuration.}
+We enable CUDA graph capture for decode execution and use KV caching throughout all experiments. 
+Unless otherwise specified, we use greedy decoding (temperature=0) to eliminate sampling variance in correctness and latency measurements. 
+For graph-correctness experiments, eager fallback is disabled unless explicitly noted.
+
+\paragraph{Storage and I/O environment.}
+Model checkpoints are stored on NFS-mounted storage, reflecting a remote-loading environment. During initialization, they are fetched via host I/O stack rather than pre-resident on device memory. Cold-start latency therefore includes checkpoint fetch, host-side loading, host-to-device transfer, and runtime initialization.
+
+\paragraph{Cold-start protocol.}
+For strict-cold experiments, each trial starts from a fresh process with no model weights resident in GPU memory.
+
+\subsection{Experimental Setup}
+
+\paragraph{Models and stages.}
+We use four model families---LLaMA-2-7B-Chat, LLaMA-2-13B-Chat~\cite{touvron2023llama2}, Falcon-7B-Instruct~\cite{almazrouei2023falcon}, and Gemma-7B~\cite{gemmateam2024gemma}
+---using our prototype built on a vLLM-based serving stack. We partition each model into an executable base (Segment A) and two later recovery segments (Segment B and Segment C). Stage~1 is the first user-visible stage after startup, while Stages~2 and~3 are recovered online as additional weights become available. The baseline waits until the full model becomes resident before serving. Exact segment partitions, parameter fractions, and checkpoint sizes are reported in the appendix.
+
+
+\paragraph{Workloads.}
+We use five workload families:
+\begin{itemize}
+    \item \textbf{Startup latency:} a strict-cold paired comparison between the baseline and ProgressiveServe, measuring TTFT under identical cold-start conditions with no prior model residency.
+    \item \textbf{Offline quality:} perplexity (PPL) on WikiText-2~\cite{merity2016wikitext} and zero-shot accuracy on seven lm-evaluation-harness tasks~\cite{eval-harness}; in the main text, we highlight PIQA~\cite{bisk2020piqa}, HellaSwag~\cite{zellers2019hellaswag}, and ARC-Easy~\cite{clark2018arc} and also report the seven-task average.
+    \item \textbf{Graph replay correctness:} graph-enabled execution compared against an eager reference under the same transition scenario.
+    \item \textbf{Online promotion:} controlled overlap-serving experiments.
+    \item \textbf{KV correctness and repair cost:} dedicated post-promotion microbenchmarks.
+\end{itemize}
+
+\paragraph{Metrics.}
+For system behavior, we report time-to-first-token (TTFT), transition-to-first-token (T2FT), post-promotion one-token tail latency, and throughput.
+Quality-recovery and KV-specific metrics are introduced in their corresponding subsections.
+We define T2FT as the elapsed time from the promotion trigger to the first token generated under the promoted stage.
+For online promotion, we distinguish clean serving, where promotion runs without competing request traffic, from live overlap-serving, where promotion overlaps with ongoing requests on the same server.
+
+Cold-start latency varies with checkpoint fetching and system conditions. We therefore report median values over 3--5 trials per configuration.
+
+
+% 7.2 Startup Availability Benefit
+\subsection{Startup Availability Benefit}
+\label{sec:eval-startup}
+We first ask whether progressive serving shortens the critical path to first usable service. Table~\ref{tab:startup-main} summarizes the strict-cold paired startup comparison across four model families.
+
+ProgressiveServe reduces cold-start TTFT by 26.1--32.4\% across all four model families (Table~\ref{tab:startup-main}). The benefit scales with model size: LLaMA-2-13B sees the largest reduction, from 292.8\,s to 198.0\,s. This benefit should be interpreted as an availability-path gain rather than a universal warm-path latency improvement;
+Stage~1 throughput remains within 1--7\% of the baseline across all models.
+
+Overall, these results show that ProgressiveServe improves startup availability rather than steady-state decode efficiency: the model becomes usable substantially earlier, while steady-state token generation remains within a small margin (1--7\% in our evaluation) of the fully recovered baseline.
+
+\begin{table*}[t]
+\centering
+\caption{Strict-cold paired startup comparison across model families.}
+\label{tab:startup-main}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Model & Base cold TTFT & Prog cold TTFT & Improve. & Base TP & Prog Stage~1 TP \\
+      & (s)            & (s)            & (\%)     & (tok/s) & (tok/s) \\
+\midrule
+LLaMA-2-7B  & 151.356 & 111.824 & 26.1 & 47.87 & 47.24 \\
+Falcon-7B   & 150.443 & 108.888 & 27.6 & 46.22 & 43.26 \\
+Gemma-7B    & 244.561 & 173.437 & 29.1 & 35.75 & 34.02 \\
+LLaMA-2-13B & 292.754 & 198.023 & 32.4 & 26.01 & 25.79 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% 7.3 Quality Retention and Recovery Across Stages
+\subsection{Quality Retention and Recovery Across Stages}
+\label{sec:eval-quality}
+
+We next ask two questions: (1) whether the earliest executable stage, Stage~1, already provides usable partial quality, and (2) how quality evolves as later-stage recovery proceeds. Table~\ref{tab:main_offline_results} reports perplexity (PPL) on WikiText-2, representative zero-shot task accuracy on PIQA, HellaSwag, ARC-Easy, and finally Avg, the unweighted mean over seven zero-shot tasks evaluated with lm-evaluation-harness (ARC-Challenge, ARC-Easy, BoolQ, HellaSwag, OpenBookQA, PIQA, and WinoGrande), excluding PPL. All results are measured on the stage-specific merged checkpoints used for recovery, rather than on adapter-attached training models.
+
+Our interpretation focuses on within-family stage-wise trends rather than absolute comparisons across families, since evaluation conditions are not perfectly matched. Gemma starts from a base checkpoint, whereas LLaMA and Falcon start from instruction-tuned checkpoints, and the pruning ratio also differs by model size (25\% for 7B and 30\% for 13B).   
+
+Overall, the results show two patterns. First, Stage~1 already preserves non-trivial utility rather than collapsing into a meaningless subnetwork. Second, quality improves progressively toward the baseline as stage recovery proceeds. For example, in LLaMA-2-7B, PPL decreases from 12.62 to 6.36 while Avg increases from 55.08 to 62.80. LLaMA-2-13B shows an even stronger trend, with Stage~3 reaching an Avg comparable to the baseline (69.32 vs.\ 69.04). Gemma-7B and Falcon-7B exhibit the same qualitative behavior. Although some individual tasks occasionally exceed the baseline, we treat such cases as task-level variation rather than evidence of universal full recovery.
+
+\paragraph{Takeaway.}
+Quality recovery is meaningful but not uniform: later stages often recover a substantial fraction of baseline quality, but the extent of recovery remains model- and task-dependent.
+
+\begin{table}[t]
+\centering
+\caption{Stage-wise offline quality across model families.}
+\label{tab:main_offline_results}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{0.95}
+
+\begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}llccccc}
+\toprule
+Model & Stage & PPL & PIQA & Hella & ARC-E & Avg \\
+\midrule
+\multirow{4}{*}{LLaMA-2-7B}
+& S1   & 12.62 & 68.99 & 60.54 & 59.60 & 55.08 \\
+& S2   &  8.73 & 74.76 & 68.04 & 70.33 & 60.38 \\
+& S3   &  6.36 & 78.13 & 72.26 & 77.27 & 62.80 \\
+& Base &  6.10 & 77.09 & 75.94 & 68.48 & 65.37 \\
+\midrule
+\multirow{4}{*}{Falcon-7B}
+& S1   & 24.82 & 68.99 & 47.64 & 54.21 & 51.19 \\
+& S2   & 21.34 & 71.71 & 53.03 & 58.88 & 54.61 \\
+& S3   & 14.66 & 74.37 & 58.61 & 65.11 & 58.45 \\
+& Base &  7.54 & 78.45 & 69.72 & 68.18 & 62.46 \\
+\midrule
+\multirow{4}{*}{Gemma-7B}
+& S1   & 23.93 & 74.48 & 55.63 & 68.52 & 53.82 \\
+& S2   & 22.98 & 76.33 & 62.69 & 72.01 & 57.81 \\
+& S3   & 16.25 & 79.27 & 71.59 & 75.51 & 65.10 \\
+& Base &  7.02 & 81.28 & 80.76 & 80.35 & 70.70 \\
+\midrule
+\multirow{4}{*}{LLaMA-2-13B}
+& S1   & 13.24 & 71.06 & 64.04 & 63.93 & 59.63 \\
+& S2   &  9.08 & 76.71 & 73.40 & 74.28 & 66.21 \\
+& S3   &  6.36 & 78.73 & 77.58 & 79.29 & 69.32 \\
+& Base &  5.41 & 79.00 & 79.95 & 73.44 & 69.04 \\
+\bottomrule
+\end{tabular*}
+\end{table}
+% 7.4 Correctness under Graph Replay
+\subsection{Correctness under Graph Replay}
+\label{sec:eval-graph-replay}
+
+We next ask whether continued CUDA-graph replay alone after stage promotion is sufficient to establish semantically correct execution. As established in Section~\ref{sec:cuda_stable_transition}, continued replay without recapture is not sufficient for correctness. We validate this claim empirically.
+
+\paragraph{Setup.}
+We use a deterministic exact-copy probe rather than an aggregate benchmark because the property under test is transition correctness, not average task quality: any deviation from eager execution is a correctness failure. The prompt is \texttt{Repeat exactly this sentence and nothing else: The cache probe key is amber.} Under the same transition scenario, we compare three executions: (1) a safe graph path that preserves the replay-safety invariants (\texttt{dualpath\_inplace}), (2) a negative control that violates those invariants by rebinding alpha-controlled state (\texttt{dualpath\_inplace+alpha\_rebind}), and (3) an eager reference. All runs use greedy decoding (temperature~=~0, no sampling) to eliminate stochastic variation and ensure that any deviation from the eager reference reflects a semantic inconsistency rather than sampling noise. Eager execution under the same promoted model serves as the semantic reference. For both graph-enabled variants, eager fallback is disabled and the run is configured to fail closed if replay cannot proceed, preventing silent eager fallback from masking an incorrect graph path.
+
+We then collect two complementary forms of evidence.
+First, we use NVIDIA Nsight Systems (NSYS) tracing to verify that the two graph-enabled executions exhibit identical replay behavior within the strict transition window.
+Second, for Stages 2 and 3, we compare their outputs with those of eager execution using the token prefix-match ratio, defined as the length of the longest common prefix divided by the generated sequence length.
+
+\paragraph{Result.}
+Table~\ref{tab:graph-replay-correctness} shows the representative result for LLaMA-2-7B. The critical observation is that the operational signal is the same in both graph-mode runs: replay continues through the strict transition window, and no recapture-management call occurs in that window. The safe graph path records 528 graph-replay API calls and zero recapture-management API calls, and still matches eager exactly at both Stage~2 and Stage~3, yielding prefix-match ratios of 1.0000/1.0000. In contrast, the negative control exhibits the same operational signature—528 replay calls and zero recapture-management calls—yet diverges sharply from eager execution, with prefix-match ratios of 0.0909/0.0909 at Stage~2/Stage~3.
+
+Table~\ref{tab:graph-replay-correctness-multimodel} shows that this separation generalizes across the completed model set: Falcon-7B, Gemma-7B, and LLaMA-2-13B all retain a 1.0000 Stage~3 prefix-match ratio on the safe path, while the negative control drops to 0.4290, 0.0625, and 0.0909, respectively, again with zero transition-window recapture-management calls. Thus, observing that replay continued—and that no recapture was observed—is insufficient as correctness evidence; semantic equivalence must be established separately against eager execution.
+
+\paragraph{Takeaway.}
+These results show that continued replay without transition-window recapture does not, by itself, guarantee semantic correctness. A graph launch succeeding after model evolution is an operational observation rather than a semantic guarantee. Semantic correctness is preserved when the replay-safety invariants are maintained. This motivates our focus on invariant preservation in Section~\ref{sec:cuda_stable_transition}.
+
+\begin{table}[t]
+\centering
+\caption{Graph-replay correctness for LLaMA-2-7B. Both variants show identical replay behavior, but only the safe path matches eager execution.}
+\label{tab:graph-replay-correctness}
+
+\small
+
+\begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lcccc}
+\toprule
+Execution mode & Replay calls & Recap calls & S2 pref. & S3 pref. \\
+\midrule
+Safe path         & 528 & 0 & 1.0000 & 1.0000 \\
+Negative control  & 528 & 0 & 0.0909 & 0.0909 \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Cross-model graph-replay correctness. Only the invariant-preserving path matches eager execution, despite zero recapture calls in all cases.}
+\label{tab:graph-replay-correctness-multimodel}
+
+\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.95}
+
+\begin{tabular}{lcccc}
+\toprule
+Model & Safe prefix & Neg. prefix & Safe recap & Neg. recap \\
+\midrule
+LLaMA-2-7B  & 1.0000 & 0.0909 & 0 & 0 \\
+Falcon-7B   & 1.0000 & 0.4290 & 0 & 0 \\
+Gemma-7B    & 1.0000 & 0.0625 & 0 & 0 \\
+LLaMA-2-13B & 1.0000 & 0.0909 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% 7.5 Online Promotion Under Serving
+\subsection{Online Promotion Under Serving}
+\label{sec:eval-online}
+
+We next ask whether stage promotion can be integrated into a live serving loop as a bounded online event rather than as a disruptive reload. To answer this question, we compare clean serving, where promotion is measured without overlapping user traffic, against live overlap-serving, where promotion proceeds concurrently with ongoing requests on the same server. The goal is to determine whether promotion can be absorbed into the serving loop as a bounded online event, with user-visible latency remaining bounded while the system continues serving.
+
+\paragraph{Setup.}
+We focus on user-visible service metrics: Stage~2 and Stage~3 time-to-first-token after promotion (T2FT), post-promotion one-token p99 latency, and steady-state Stage~3 throughput. This framing directly captures the systems question relevant to deployment: whether promotion can be absorbed into the serving loop without degrading service quality to the point that it resembles a full disruptive reload.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figure5}
+\caption{
+Request-visible transition under clean serving versus live overlap-serving. In live overlap-serving, part of the prefetch work is hidden before the request boundary, so the user-visible transition-to-first-token (T2FT) is reduced even though the same promotion mechanism is used.
+}
+\label{fig:online-transition-timeline}
+\end{figure}
+Figure~\ref{fig:online-transition-timeline} illustrates the difference between clean serving and live overlap-serving, highlighting how part of the prefetch work is hidden before the request boundary.
+
+\paragraph{Result.}
+Table~\ref{tab:online-promotion} shows that live overlap-serving reduces T2FT by 33--65\% across all models and stages, with the largest gain in LLaMA-2-7B Stage~2 (\(15.1\,s\!\rightarrow\!5.2\,s, 2.9\times\)). Post-promo-tion p99 latency and throughput remain virtually unchanged.
+
+Despite these substantial reductions in transition latency, post-promotion performance remains stable. Across all models, Stage~3 one-token p99 latency remains tightly bounded (0.043--0.081\,s), and steady-state throughput remains nearly unchanged compared to clean serving. This shows that live overlap-serving does not trade transition latency for degraded steady-state performance.
+
+\paragraph{Takeaway.}
+These results demonstrate that ProgressiveServe converts stage promotion from a disruptive reload into a bounded online event. Live overlap-serving hides a large fraction (33--65\%) of the transition cost while keeping post-promotion p99 latency and throughput largely unchanged.
+We further validate controller-driven promotion in Appendix~\ref{app:auto-promotion}, showing that readiness-latched promotion can often be absorbed before the first user-visible request and remains stable when triggered at safe request boundaries.
+
+
+
+
+\begin{table*}[t]
+\centering
+\caption{Online promotion under serving. Values are reported as clean / live.}
+\label{tab:online-promotion}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+Model 
+& \makecell{Stage~2 T2FT\\(s)} 
+& \makecell{Stage~3 T2FT\\(s)} 
+& \makecell{Stage~3 p99\\(s)} 
+& \makecell{Throughput\\(tok/s)} \\
+\midrule
+LLaMA-2-7B  & 15.116 / 5.235 & 15.400 / 7.682 & 0.043 / 0.043 & 47.29 / 47.25 \\
+Falcon-7B   & 17.132 / 11.322 & 15.405 / 10.429 & 0.047 / 0.047 & 45.00 / 44.28 \\
+Gemma-7B    & 19.310 / 10.283 & 22.876 / 14.509 & 0.060 / 0.058 & 32.88 / 34.36 \\
+LLaMA-2-13B & 48.620 / 24.430 & 39.563 / 22.834 & 0.080 / 0.081 & 25.58 / 25.58 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+\subsection{Cache Correctness and Repair Cost}
+\label{sec:eval-kv}
+
+We next ask whether boundary-aware KV repair is necessary for correctness, and whether it remains cheap enough to preserve the first post-promotion user interaction. We separate these two questions explicitly: correctness on the newly appended segment after a promotion, and request TTFT on the first post-promotion turn. Exact per-model values and normalized repair work are reported in Appendix~\ref{app:kv-repair-details}.
+
+\paragraph{Methodology.}
+For correctness, we use the lossless three-turn probe from Section~\ref{sec:kv_repair}. Stage~1 serves segment \(A\). After the Stage~\(1\!\rightarrow\!2\) promotion, we promote segment \(B\) in place and measure perplexity only on its newly activated layers. After the Stage~\(2\!\rightarrow\!3\) promotion, we append segment \(C\) and measure perplexity only on \(C\). We compare three policies: \textit{Oracle-Recompute}, which invalidates the prefix cache and recomputes the prefix under the promoted model; \textit{Stale-Reuse}, which reuses pre-promotion KV unchanged; and \textit{ProgressiveServe-Repair}, which preserves the unchanged lower-prefix state and rematerializes only the suffix at and beyond the promotion point. To avoid ratio-heavy presentation, we report \(\Delta\)PPL relative to \textit{Oracle-Recompute}.
+
+\paragraph{Repair is required for correctness.}
+Figure~\ref{fig:kv-delta-ppl} shows a consistent pattern across LLaMA-2-7B, Falcon-7B, Gemma-7B, and LLaMA-2-13B. \textit{ProgressiveServe-Repair} stays close to the oracle, with \(\Delta\)PPL between \(-0.50\) and \(+0.60\) across both promotions. In contrast, \textit{Stale-Reuse} always degrades correctness: on segment \(B\), it adds \(+1.03\) to \(+2.76\) PPL, and on segment \(C\), it adds \(+1.43\) to \(+6.79\) PPL. For the representative LLaMA-2-7B run, stale reuse increases PPL by \(+1.74\) on \(B\) and \(+3.87\) on \(C\), whereas ProgressiveServe-Repair stays within \(-0.17\) and \(+0.02\). These gaps are too large to treat stale at and beyond the promotion point; once the model changes at promotion time, the affected suffix must be repaired.
+
+\paragraph{Repair keeps the first post-promotion turn responsive.}
+Correctness alone would not be useful if repair simply replaced stale reuse with a full-prefix stall. We therefore sweep accumulated prefix length \(T\) on LLaMA-2-7B and compare \textit{ProgressiveServe-Repair} against a correctness-preserving \textit{Full-Reset} baseline, which discards the prefix cache and forces the next request to re-prefill under the promoted model. Figure~\ref{fig:kv-request-ttft} shows that \textit{Full-Reset} grows sharply with prefix length, while \textit{ProgressiveServe-Repair} remains nearly flat. At \(T{=}1500\), the first post-promotion request TTFT falls from \(227.7\) to \(56.7\) ms for Stage~\(1\!\rightarrow\!2\) and from \(228.5\) to \(54.4\) ms for Stage~\(2\!\rightarrow\!3\). The same trend holds across all models at each model's longest tested prefix: ProgressiveServe reduces first-request TTFT by \(171.0\) to \(326.6\) ms while keeping the repair fast path successful in all completed runs.
+
+\paragraph{Takeaway.}
+Boundary-aware KV repair is not an optional optimization layered on top of progressive serving. It is required to recover oracle-level post-promotion behavior on the newly appended segment, yet it does so without introducing a user-visible full-prefix stall. ProgressiveServe therefore preserves both semantic correctness and request responsiveness across stage promotions.
+
+\begin{figure*}[t]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\includegraphics[
+  width=\textwidth,
+  trim=0 10 0 6,
+  clip
+]{kv_delta_ppl_stage12_revision.pdf}
+\vspace{-0.4mm}
+
+\small\textbf{(a)} \(\Delta\)PPL on segment \(B\) after Stage~\(1\!\rightarrow\!2\)
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\includegraphics[
+  width=\textwidth,
+  trim=0 10 0 6,
+  clip
+]{kv_delta_ppl_stage23_revision.pdf}
+\vspace{-0.4mm}
+
+\small\textbf{(b)} \(\Delta\)PPL on segment \(C\) after Stage~\(2\!\rightarrow\!3\)
+\end{minipage}
+\caption{
+KV cache correctness as \(\Delta\)PPL relative to \textit{Oracle-Recompute}. \textit{ProgressiveServe-Repair} stays near zero across both promotions, while \textit{Stale-Reuse} consistently degrades perplexity.
+}
+\label{fig:kv-delta-ppl}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\includegraphics[
+  width=\textwidth,
+  trim=0 6.5 0 12,
+  clip
+]{kv_request_ttft_stage12_revision.pdf}
+\vspace{-0.4mm}
+
+\small\textbf{(a)} First post-promotion request TTFT after Stage~\(1\!\rightarrow\!2\)
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\includegraphics[
+  width=\textwidth,
+  trim=0 6.5 0 12,
+  clip
+]{kv_request_ttft_stage23_revision.pdf}
+\vspace{-0.4mm}
+
+\small\textbf{(b)} First post-promotion request TTFT after Stage~\(2\!\rightarrow\!3\)
+\end{minipage}
+\caption{
+First post-promotion request TTFT versus prefix length for LLaMA-2-7B. \textit{Full-Reset} grows with prefix length, while \textit{ProgressiveServe-Repair} remains nearly flat.
+}
+\label{fig:kv-request-ttft}
+\end{figure*}
+
+\subsection{Limitations and Future Work}
+\label{sec:eval-limitations}
+
+\paragraph{Distributed and multi-GPU settings.}
+Our current prototype targets single-GPU execution. This scope is deliberate: replay-safe promotion and boundary-aware KV repair must first be established on a single worker before they can be extended to tensor- or pipeline-parallel deployments. Extending these invariants to distributed execution requires coordinated promotion boundaries and cross-rank synchronization, which we leave to future work.
+
+\paragraph{Promotion policy and heterogeneous environments.}
+Our evaluation focuses on promotion correctness and bounded overlap-serving rather than controller design. We include only supplementary evidence for readiness-latched promotion and do not evaluate robust trigger policies under heterogeneous storage or multi-tenant interference. Adaptive recovery policies for such environments remain future work.
+
+\paragraph{Summary.}
+These results show that progressive recovery fundamentally changes the startup behavior of serverless LLM serving.
+First, ProgressiveServe substantially shortens the critical path to startup availability across the currently completed model families.
+Second, intermediate stages recover useful but task-dependent quality before full recovery.
+Third, controlled overlap-serving shows that later stages can be recovered online while keeping promotion-time latency and throughput stable.
+
+
+
+\section{Discussion}
+
+\paragraph{Alternative design choices.}
+An alternative is to serve a smaller standalone model first and later hand off to the full model. That design typically requires cross-model state transfer or cache reinitialization at handoff, 
+which breaks execution and cache continuity, leading to a disruptive transition. In contrast, ProgressiveServe keeps a single model instance and evolves it in place, preserving both execution continuity and cache continuity across stages.
+
+\paragraph{Scope of applicability.}
+Our current prototype targets dense decoder-only models on a single GPU. 
+Extending replay-safe model evolution to distributed or heterogeneous deployments introduces additional challenges, 
+including cross-device synchronization and coordinated promotion boundaries. 
+ProgressiveServe establishes the single-device invariants required for such extensions, 
+which we view as a necessary first step toward distributed progressive serving.
+
+\section{Related Work}
+
+\paragraph{Serverless LLM cold starts and fast startup.}
+Recent systems reduce serverless LLM startup latency by shortening checkpoint fetch and runtime preparation. ServerlessLLM exploits multi-tier checkpoint loading, live inference migration, and startup-aware scheduling~\cite{serverlessllm}. HydraServe overlaps cold-start stages within workers and uses pipeline parallelism and pipeline consolidation to accelerate public-cloud cold starts~\cite{hydraserve}. More recently, $\lambda$Scale begins inference before each node has received a full model replica by combining model multicast with cross-node ``execute-while-load'' execution~\cite{lscale}. ProgressiveServe is complementary but distinct: it addresses replay-safe in-place model evolution under partial readiness, rather than faster all-or-nothing loading or cross-node execute-while-load.
+
+\paragraph{LLM serving engines and decode-path optimization.}
+Systems such as ORCA~\cite{yu2022orca}, vLLM~\cite{vllm_sosp23}, and Sarathi-Serve~\cite{agrawal2024sarathiserve} optimize batching, scheduling, and KV cache management for steady-state serving of a fixed resident model, but do not address replay-safe stage promotion during active serving.
+
+\paragraph{Adaptive depth, pruning, and early exit.}
+Layer-pruning studies show that contiguous deeper layers can often be removed with limited quality loss and partially healed with lightweight finetuning~\cite{gromov2024deeperlayers,fan2020layerdrop, sanh2020movement}. Early-exit systems such as LayerSkip terminate computation at shallower layers to reduce inference cost~\cite{elhoushi2024layerskip}. In both cases, the reduced model is treated as the final inference target. ProgressiveServe uses pruning differently: it defines an early executable stage, but the removed capacity is not permanent. Instead, it is progressively recovered online, introducing a systems problem---execution-safe promotion and cache repair during service---that prior pruning or early-exit methods do not target.
+
+
+\paragraph{KV cache reuse and state recovery.}
+Existing cache-reuse techniques assume a fixed model and seek to avoid redundant prefill or recover prior conversational state. Prompt Cache reuses attention states across modular prompt segments~\cite{gim2024promptcache}, HCache restores serving state from intermediate hidden activations rather than recomputing from original tokens or relying solely on KV-cache offloading~\cite{hcache_eurosys25}, and CacheBlend selectively recomputes a subset of KV values to fuse cached chunks~\cite{cacheblend_eurosys25}. ProgressiveServe addresses a different failure mode: after stage promotion, cached states produced under the earlier stage may become stale because the active parameterization has changed. Its boundary-aware KV repair restores cache correctness throughout model evolution, not just cache reuse under fixed weights.
+
+
+\section{Conclusion}
+We presented ProgressiveServe, a system that reformulates serverless LLM cold start as progressive recovery under partial model availability. Rather than waiting for the full checkpoint, ProgressiveServe begins serving from a compact executable base and recovers full model capacity through staged promotions during live serving.
+
+Two mechanisms make this feasible. Virtual layers maintain a fixed execution skeleton so that stage promotion reduces to a tensor-state update with no CUDA graph rebuild. Boundary-aware KV cache repair recomputes only the entries invalidated by newly activated layers, avoiding a full cache reset. An offline preparation pipeline constructs the executable base and ordered recovery stages compatible with virtual-layer promotion and KV cache repair at runtime.
+
+
+Our experiments show that ProgressiveServe reduces cold-start time-to-first-token (TTFT) by 26.1--32.4\% relative to full-model loading, while preserving output quality close to the fully recovered model after final promotion and maintaining bounded promotion overhead during serving.
+
+This work points to a broader shift in how serverless LLM startup should be viewed: not as a binary wait for full readiness, but as a structured recovery process that exposes useful service early and recovers capacity incrementally.
+
+\FloatBarrier
+\section{Appendix}
+
+%%수정%%
+\subsection{Offline Stage Preparation}
+\paragraph{Pruning Setup}
+We use the angular-distance criterion in Eq.~(1) as the offline
+block-selection step. For the 7B models, we use a pruning ratio
+of 25\% and a calibration sequence length of 1024, while for the
+13B model we use 30\% and 2048, respectively. The remaining
+offline calibration settings are shared across models, as summarized
+in Table~\ref{tab:offline_calibration}.
+
+\begin{table}[t]
+\centering
+\caption{Shared offline calibration settings for block selection.}
+\label{tab:offline_calibration}
+\begin{tabular}{lc}
+\toprule
+Item & Value \\
+\midrule
+Calibration corpus & C4~\cite{raffel2020t5} \\
+Number of samples & 64 \\
+Maximum calibration batches & 32 \\
+Keep final layer & True \\
+Seed & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\paragraph{Fixed stage layouts.}
+Table~\ref{tab:appendix-stage-layout} summarizes the fixed per-model stage
+layouts used throughout the paper. Stage~1 is the executable skeleton
+loaded at cold start, while Stages~2 and~3 progressively recover the
+two segments of the deferred contiguous block. Reported shares are the
+checkpoint storage shares of the corresponding A/B/C segments. All
+stage layouts are fixed before evaluation and reused consistently in
+offline checkpoint preparation, cold-start experiments, and online
+promotion.
+
+
+\begin{table}[t]
+\centering
+\caption{Fixed per-model stage layouts. Stage~1 is the executable skeleton loaded at cold start, while Stage~2 and Stage~3 progressively recover the two segments of the deferred contiguous block. Reported shares are checkpoint storage shares of the A/B/C segments.}
+\label{tab:appendix-stage-layout}
+\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.95}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+Model
+& \makecell{Stage~1 active layers\\storage share / size}
+& \makecell{Stage~2 recovered layers\\storage share / size}
+& \makecell{Stage~3 recovered layers\\storage share / size} \\
+\midrule
+LLaMA-2-7B
+& \makecell{0--20, 29--31\\75.97\% / 9.54 GiB}
+& \makecell{21--24\\12.01\% / 1.51 GiB}
+& \makecell{25--28\\12.01\% / 1.51 GiB} \\
+
+Falcon-7B
+& \makecell{0--18, 27--31\\77.05\% / 10.36 GiB}
+& \makecell{19--22\\11.48\% / 1.54 GiB}
+& \makecell{23--26\\11.48\% / 1.54 GiB} \\
+
+Gemma-7B
+& \makecell{0--11, 19--27\\77.30\% / 12.29 GiB}
+& \makecell{12--14\\9.73\% / 1.55 GiB}
+& \makecell{15--18\\12.97\% / 2.06 GiB} \\
+
+LLaMA-2-13B
+& \makecell{0--23, 36--39\\70.76\% / 17.15 GiB}
+& \makecell{24--29\\14.62\% / 3.55 GiB}
+& \makecell{30--35\\14.62\% / 3.55 GiB} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+
+\subsection{Progressive Stage-wise LoRA Adaptation}
+
+\paragraph{LoRA formulation.}
+We use Low-Rank Adaptation (LoRA) for stage-wise parameter adaptation.
+For a pretrained weight $W_0$, LoRA introduces a low-rank update
+$\Delta W = BA$, such that the adapted weight becomes
+\[
+W = W_0 + \Delta W = W_0 + BA.
+\]
+In our pipeline, LoRA is used only as an offline stage-aligned
+adaptation mechanism for preparing merged checkpoints. After each
+stage, the trained adapters are merged into the base weights so that
+later online promotion changes parameter state without altering module
+structure.
+
+\paragraph{LoRA attachment scope.}
+Within each target layer, LoRA adapters are attached to all dense
+projections of both the self-attention and feed-forward sublayers.
+For LLaMA-2 (7B, 13B) and Gemma-7B, this corresponds to the seven
+projections \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj},
+\texttt{o\_proj}, \texttt{gate\_proj}, \texttt{up\_proj}, and
+\texttt{down\_proj}. For Falcon-7B-Instruct, whose decoder uses a
+fused \texttt{query\_key\_value} projection and a non-gated feed-forward
+network, the attachment covers \texttt{query\_key\_value}, \texttt{dense},
+\texttt{dense\_h\_to\_4h}, and \texttt{dense\_4h\_to\_h}. The equivalent
+set is resolved automatically at attach time via runtime module
+inspection, so the same ``all attention projections + all MLP projections''
+policy applies uniformly across architectures. The attachment is further
+restricted to the layer indices of the stage under training, so each
+stage only trains adapters on the newly recovered layer subset.
+
+\paragraph{Stage-wise training schedule.}
+Table~\ref{tab:stage_schedule} summarizes the stage-wise adaptation
+schedule. For the 7B models, we use a $2/1/1$ epoch schedule for
+Stages~1/2/3, while LLaMA-2-13B uses $4/2/2$. Aside from per-stage
+epoch count, the remaining training hyperparameters are held fixed.
+
+\begin{table}[t]
+\centering
+\caption{Stage-wise adaptation schedule.}
+\label{tab:stage_schedule}
+\small
+\setlength{\tabcolsep}{4pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{c l c c c c}
+\toprule
+Stage & Segment & Target & LR & Ep. (7B) & Ep. (13B) \\
+\midrule
+1 & A + B,C virtual & A & 3e-4 & 2 & 4 \\
+2 & A\_merged + B recovered + C virtual & B & 3e-5 & 1 & 2 \\
+3 & A\_merged + B\_merged + C restored & C & 3e-5 & 1 & 2 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+
+The reduced learning rate and epoch count at Stages~2 and~3 reflect
+the fact that earlier segments are already merged and frozen; the
+adapters therefore only need to fit the residual perturbation
+introduced by newly restored layers.
+
+\paragraph{Common LoRA and training configuration.}
+Table~\ref{tab:lora_config} lists the training configuration shared
+across stages unless otherwise noted.
+
+\begin{table}[t]
+\centering
+\caption{Common LoRA and training configuration.}
+\label{tab:lora_config}
+\begin{tabular}{lc}
+\toprule
+Item & Value \\
+\midrule
+Dataset & SQuAD v1 \\
+Train subset & 20,000 \\
+Eval subset & 8,000 \\
+Sequence length & 2048 \\
+LoRA rank & 8 \\
+LoRA $\alpha$ & 16 \\
+LoRA dropout & 0.05 \\
+Optimizer & adamw\_torch\_fused \\
+Precision & bf16 \\
+Batch size & 1 \\
+Gradient accumulation & 32 \\
+Warmup ratio & 0.1 \\
+Max grad norm & 1.0 \\
+Gradient checkpointing & Enabled \\
+Seed & 42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\subsection{Extended KV Repair Results}
+\label{app:kv-repair-details}
+
+The main text focuses on two user-facing conclusions: stale post-promotion KV is incorrect, and boundary-aware repair avoids turning the next user turn into a full-prefix stall. This appendix provides the exact per-model deltas together with the normalized repair work that remains internal to the runtime rather than directly user-visible.
+
+\paragraph{Normalized repair work.}
+Figure~\ref{fig:kv-repair-overhead-app} reports normalized repair overhead for the representative LLaMA-2-7B scaling sweep. The overhead decreases as the prefix grows because synchronization and suffix rematerialization are amortized over more cached tokens. Even at the longest tested prefix, the repair path remains bounded at \(95.8\)~\(\mu\)s/token for Stage~\(1\!\rightarrow\!2\) and \(71.8\)~\(\mu\)s/token for Stage~\(2\!\rightarrow\!3\), while the repair fast path succeeds in \(100\%\) of runs.
+
+\begin{figure}[t]
+\centering
+\begin{minipage}[t]{0.98\columnwidth}
+\centering
+\includegraphics[
+  width=\linewidth,
+  trim=0 7 0 7,
+  clip
+]{kv_repair_overhead_stage12_revision.pdf}
+\vspace{-0.6mm}
+
+\small\textbf{(a)} Normalized repair overhead after Stage~\(1\!\rightarrow\!2\)
+\end{minipage}
+\par\vspace{4.0mm}
+\begin{minipage}[t]{0.98\columnwidth}
+\centering
+\includegraphics[
+  width=\linewidth,
+  trim=0 7 0 7,
+  clip
+]{kv_repair_overhead_stage23_revision.pdf}
+\vspace{-0.6mm}
+
+\small\textbf{(b)} Normalized repair overhead after Stage~\(2\!\rightarrow\!3\)
+\end{minipage}
+\par\vspace{3.0mm}
+\caption{
+Normalized repair overhead for the representative LLaMA-2-7B scaling sweep. As prefix length grows, the per-token repair work decreases because the fixed synchronization and boundary-local rematerialization cost is amortized over a longer cached context.
+}
+\label{fig:kv-repair-overhead-app}
+\end{figure}
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{0.95}
+\caption{
+Exact KV-repair summary. \(\Delta\)PPL is measured relative to \textit{Oracle-Recompute} on the newly appended segment. TTFT reduction is measured against \textit{Full-Reset} on the first post-promotion request at the longest tested prefix. Models are ordered consistently as LLaMA-2-7B, Falcon-7B, Gemma-7B, and LLaMA-2-13B.
+}
+\label{tab:kv-repair-summary-appendix}
+\begin{tabular}{lrrrrcc}
+\toprule
+Model
+& \makecell{Repair\\\(\Delta\)PPL on \(B\)}
+& \makecell{Stale\\\(\Delta\)PPL on \(B\)}
+& \makecell{Repair\\\(\Delta\)PPL on \(C\)}
+& \makecell{Stale\\\(\Delta\)PPL on \(C\)}
+& \makecell{TTFT reduction @ \(T_{\max}\)\\(Stage~\(1\!\rightarrow\!2\) / Stage~\(2\!\rightarrow\!3\), ms)}
+& \makecell{Repair overhead @ \(T_{\max}\)\\(Stage~\(1\!\rightarrow\!2\) / Stage~\(2\!\rightarrow\!3\), \(\mu\)s/token)} \\
+\midrule
+LLaMA-2-7B
+& \(-0.17\)
+& \(+1.74\)
+& \(+0.02\)
+& \(+3.87\)
+& 171.0 / 174.1
+& 95.8 / 71.8 \\
+Falcon-7B
+& \(-0.50\)
+& \(+1.08\)
+& \(+0.60\)
+& \(+6.79\)
+& 184.8 / 181.0
+& 91.2 / 79.9 \\
+Gemma-7B
+& \(+0.08\)
+& \(+2.76\)
+& \(+0.12\)
+& \(+4.91\)
+& 204.6 / 207.8
+& 214.0 / 199.1 \\
+LLaMA-2-13B
+& \(-0.12\)
+& \(+1.03\)
+& \(+0.10\)
+& \(+1.43\)
+& 321.7 / 326.6
+& 137.4 / 109.1 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Token-count note.}
+The longest realized prefix is \(T_{\max}{=}1500\) for both LLaMA models, \(1487\) for Falcon-7B, and \(1483\) for Gemma-7B because the realized token count follows the model-specific tokenizer.
+
+\subsection{Integration with vLLM's prefix cache.}
+\label{app:vllm-prefix-cache}
+
+ProgressiveServe's rematerialization writes repaired KV states directly into vLLM's existing physical cache slots~\cite{vllm_prefix_docs}. Given sequence length $T$ and block size $B$, the physical slot for token position $t$ is determined by
+\begin{equation}
+\pi(t)=\mathrm{BT}\!\left(\left\lfloor t/B \right\rfloor\right)
+\cdot B + (t \bmod B),
+\label{eq:slot_mapping}
+\end{equation}
+where $\mathrm{BT}(\cdot)$ maps logical to physical cache blocks. Rematerialization writes repaired KV directly to $\pi(t)$ for layers $l \ge b$, preserving hash-to-block ownership so that later requests continue to benefit from prefix hits.
+
+
+
+\subsection{Exploratory Readiness-Latched Auto-Promotion}
+\label{app:auto-promotion}
+
+The main text evaluates ProgressiveServe under controlled clean/live overlap-serving in order to isolate the promotion mechanism itself rather than the controller policy.
+As a supplementary controller-level study, we additionally evaluate a lightweight readiness-latched auto-promotion controller on top of the same live transition mechanism.
+In this setting, Stage~2 prefetch is pre-armed before the first user-visible request.
+Once Stage~2 prefetch becomes ready, the controller latches readiness and applies promotion only at the next safe request boundary; it never promotes mid-response.
+
+We evaluate this controller on LLaMA-2-7B over eight repeated runs using an 8~s initial pre-request slack and a 48-turn maximum observation budget.
+Stage~2 promotion completed before the first user-visible request in 6 of 8 runs.
+This suggests that prefetch can often be fully hidden before the first user-visible request under favorable conditions.
+The remaining two runs promoted at later safe boundaries after 6 and 11 Stage~1 turns, respectively, and no run required forced fallback.
+Consequently, the median time from the first request to completed Stage~2 promotion was \(0.00\)~s and the median number of turns until promotion was \(0\), while the mean promotion delay was \(4.20\)~s due to the two late-latching outliers.
+
+This behavior is summarized in Table~\ref{tab:auto-promotion-favorable}.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{0.95}
+\caption{Exploratory readiness-latched Stage~2 auto-promotion on LLaMA-2-7B.}
+\label{tab:auto-promotion-favorable}
+\begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lr}
+\toprule
+Metric & Value \\
+\midrule
+Runs & 8 \\
+Promotion before 1st request & 6/8 (75\%) \\
+Forced fallback & 0/8 \\
+Median promotion time (s) & 0.00 \\
+Mean promotion time (s) & 4.20 \\
+Median turns & 0 \\
+Mean turns & 2.13 \\
+Median transition (s) & 0.525 \\
+Mean transition (s) & 0.528 \\
+Median T2FT (s) & 0.661 \\
+Mean T2FT (s) & 0.670 \\
+Mean instant time (s) & 0.515 \\
+Mean p99 (s) & 0.043 \\
+Throughput (tok/s) & 47.38 \\
+\bottomrule
+\end{tabular*}
+
+
+\end{table}
+
+As shown in Table~\ref{tab:auto-promotion-favorable}, once promotion occurred, the handoff itself remained stable.
+The median request-visible transition time was \(0.525\)~s and the mean request-visible transition time was \(0.528\)~s.
+The mean Stage~2 T2FT from the promotion request was \(0.670\)~s, the mean instant transition time was \(0.515\)~s, the mean Stage~2 one-token p99 latency was \(0.043\)~s, and the mean Stage~2 throughput was \(47.38\)~tok/s.
+These values are consistent with the live overlap-serving results, indicating that controller-driven promotion does not introduce additional transition overhead beyond the promotion mechanism itself.
+
+We therefore treat this experiment as supplementary controller-level evidence.
+Importantly, the results indicate that the underlying promotion mechanism itself remains stable and low-overhead once triggered,
+and that the primary limitation lies in controller timing rather than in the promotion mechanism.
+
+\FloatBarrier
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}

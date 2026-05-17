@@ -1,0 +1,1392 @@
+{
+  "measurement_mode": "true_e2e",
+  "model": "falcon-7b",
+  "stage": "1to2",
+  "num_runs": 1,
+  "timestamp": "2026-04-15T18:59:06.338549",
+  "cache_condition": "cold",
+  "strict_partial_path": true,
+  "max_model_len": 2048,
+  "gpu_name": "NVIDIA RTX A6000",
+  "gpu_total_mem_gb": 47.43,
+  "gpu_memory_utilization_requested": 0.7,
+  "gpu_memory_utilization_effective": 0.7,
+  "gpu_memory_utilization_worker_min": 0.7,
+  "gpu_memory_utilization_worker_max": 0.7,
+  "gpu_memory_utilization_clamped_any": false,
+  "gpu_memory_reserve_gb": 1.0,
+  "tensor_parallel_size_effective": 1,
+  "progressive_impl": "progressive_serve5",
+  "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+  "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+  "stage_b_checkpoint": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+  "stage_c_checkpoint": "/acpl-ssd32/falcon-7b/final_merged/stage3_layers_C.safetensors",
+  "trust_remote_code": false,
+  "enable_prefix_caching": true,
+  "disable_sliding_window": false,
+  "enforce_eager": false,
+  "require_drop_caches": true,
+  "skip_drop_caches": false,
+  "drop_caches_timeout_s": 60.0,
+  "stage1_warmup_runs": 3,
+  "stage_transition_timeout_s": 300.0,
+  "fixed_question": "Briefly summarize the key points discussed so far.",
+  "scaling": [
+    {
+      "target_T": 200,
+      "actual_T": 199,
+      "cache_condition": "cold",
+      "strict_partial_path": true,
+      "n_Q_tokens": 19,
+      "n_total_tokens": 218,
+      "kv_cache_gb_theoretical": 0.113,
+      "partial": {
+        "source_fill_s": 0.0617,
+        "source_fill_s_stats": {
+          "mean": 0.0617,
+          "std": 0.0,
+          "median": 0.0617,
+          "min": 0.0617,
+          "max": 0.0617,
+          "n": 1
+        },
+        "prefetch_s": 17.9448,
+        "prefetch_s_stats": {
+          "mean": 17.9448,
+          "std": 0.0,
+          "median": 17.9448,
+          "min": 17.9448,
+          "max": 17.9448,
+          "n": 1
+        },
+        "activation_s": 0.2339,
+        "activation_s_stats": {
+          "mean": 0.2339,
+          "std": 0.0,
+          "median": 0.2339,
+          "min": 0.2339,
+          "max": 0.2339,
+          "n": 1
+        },
+        "sync_s": 0.0017,
+        "sync_s_stats": {
+          "mean": 0.0017,
+          "std": 0.0,
+          "median": 0.0017,
+          "min": 0.0017,
+          "max": 0.0017,
+          "n": 1
+        },
+        "reconcile_s": 0.0645,
+        "reconcile_s_stats": {
+          "mean": 0.0645,
+          "std": 0.0,
+          "median": 0.0645,
+          "min": 0.0645,
+          "max": 0.0645,
+          "n": 1
+        },
+        "request_ttft_s": 0.049,
+        "request_ttft_s_stats": {
+          "mean": 0.049,
+          "std": 0.0,
+          "median": 0.049,
+          "min": 0.049,
+          "max": 0.049,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.2941,
+        "e2e_from_request_s_stats": {
+          "mean": 18.2941,
+          "std": 0.0,
+          "median": 18.2941,
+          "min": 18.2941,
+          "max": 18.2941,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.3558,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.3558,
+          "std": 0.0,
+          "median": 18.3558,
+          "min": 18.3558,
+          "max": 18.3558,
+          "n": 1
+        },
+        "surgery_success_rate": 1.0,
+        "reconcile_path_counts": {
+          "surgery": 1
+        },
+        "boundary_values": [
+          19
+        ],
+        "last_surgery_profile": {
+          "success": true,
+          "reason": "ok",
+          "boundary": 19,
+          "seq_len": 200,
+          "num_blocks_needed": 13,
+          "available_blocks": 128,
+          "elapsed_ms": 58.369096368551254
+        },
+        "last_partial_recompute_profile": null,
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "origin": {
+        "source_fill_s": 0.0582,
+        "source_fill_s_stats": {
+          "mean": 0.0582,
+          "std": 0.0,
+          "median": 0.0582,
+          "min": 0.0582,
+          "max": 0.0582,
+          "n": 1
+        },
+        "prefetch_s": 18.024,
+        "prefetch_s_stats": {
+          "mean": 18.024,
+          "std": 0.0,
+          "median": 18.024,
+          "min": 18.024,
+          "max": 18.024,
+          "n": 1
+        },
+        "activation_s": 0.2551,
+        "activation_s_stats": {
+          "mean": 0.2551,
+          "std": 0.0,
+          "median": 0.2551,
+          "min": 0.2551,
+          "max": 0.2551,
+          "n": 1
+        },
+        "cache_invalidate_s": 0.033,
+        "cache_invalidate_s_stats": {
+          "mean": 0.033,
+          "std": 0.0,
+          "median": 0.033,
+          "min": 0.033,
+          "max": 0.033,
+          "n": 1
+        },
+        "request_ttft_s": 0.0575,
+        "request_ttft_s_stats": {
+          "mean": 0.0575,
+          "std": 0.0,
+          "median": 0.0575,
+          "min": 0.0575,
+          "max": 0.0575,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.3697,
+        "e2e_from_request_s_stats": {
+          "mean": 18.3697,
+          "std": 0.0,
+          "median": 18.3697,
+          "min": 18.3697,
+          "max": 18.3697,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.4278,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.4278,
+          "std": 0.0,
+          "median": 18.4278,
+          "min": 18.4278,
+          "max": 18.4278,
+          "n": 1
+        },
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "request_only_speedup_ratio": 1.17,
+      "e2e_speedup_ratio": 1.0,
+      "source_fill_inclusive_speedup_ratio": 1.0,
+      "request_only_savings_s": 0.0085,
+      "e2e_savings_s": 0.0756,
+      "source_fill_inclusive_savings_s": 0.072,
+      "partial_runs": [
+        {
+          "skip": false,
+          "branch": "partial",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.281142,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 200,
+          "actual_T": 199,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 218,
+          "source_fill_s": 0.061692,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 17.944812,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.05592403560876846,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.755115617066622,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.233904,
+          "sync_s": 0.001696,
+          "reconcile_s": 0.064509,
+          "request_ttft_s": 0.048966,
+          "e2e_from_request_s": 18.29411,
+          "e2e_from_source_fill_s": 18.355802,
+          "surgery_ok": true,
+          "boundary": 19,
+          "reconcile_path": "surgery",
+          "surgery_profile": {
+            "success": true,
+            "reason": "ok",
+            "boundary": 19,
+            "seq_len": 200,
+            "num_blocks_needed": 13,
+            "available_blocks": 128,
+            "elapsed_ms": 58.369096368551254
+          },
+          "partial_recompute_profile": null,
+          "kv_cache_gb_theoretical": 0.113,
+          "cpu_mem_gb": 8.183,
+          "gpu_mem_gb": 32.623
+        }
+      ],
+      "origin_runs": [
+        {
+          "skip": false,
+          "branch": "origin",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.045761,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 200,
+          "actual_T": 199,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 218,
+          "source_fill_s": 0.058185,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 18.024039,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.05001361109316349,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.842545924708247,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.255094,
+          "cache_invalidate_s": 0.032954,
+          "request_ttft_s": 0.057503,
+          "e2e_from_request_s": 18.369657,
+          "e2e_from_source_fill_s": 18.427842,
+          "kv_cache_gb_theoretical": 0.113,
+          "cpu_mem_gb": 8.156,
+          "gpu_mem_gb": 32.542
+        }
+      ]
+    },
+    {
+      "target_T": 500,
+      "actual_T": 496,
+      "cache_condition": "cold",
+      "strict_partial_path": true,
+      "n_Q_tokens": 19,
+      "n_total_tokens": 515,
+      "kv_cache_gb_theoretical": 0.269,
+      "partial": {
+        "source_fill_s": 0.1171,
+        "source_fill_s_stats": {
+          "mean": 0.1171,
+          "std": 0.0,
+          "median": 0.1171,
+          "min": 0.1171,
+          "max": 0.1171,
+          "n": 1
+        },
+        "prefetch_s": 17.8839,
+        "prefetch_s_stats": {
+          "mean": 17.8839,
+          "std": 0.0,
+          "median": 17.8839,
+          "min": 17.8839,
+          "max": 17.8839,
+          "n": 1
+        },
+        "activation_s": 0.2424,
+        "activation_s_stats": {
+          "mean": 0.2424,
+          "std": 0.0,
+          "median": 0.2424,
+          "min": 0.2424,
+          "max": 0.2424,
+          "n": 1
+        },
+        "sync_s": 0.0034,
+        "sync_s_stats": {
+          "mean": 0.0034,
+          "std": 0.0,
+          "median": 0.0034,
+          "min": 0.0034,
+          "max": 0.0034,
+          "n": 1
+        },
+        "reconcile_s": 0.0811,
+        "reconcile_s_stats": {
+          "mean": 0.0811,
+          "std": 0.0,
+          "median": 0.0811,
+          "min": 0.0811,
+          "max": 0.0811,
+          "n": 1
+        },
+        "request_ttft_s": 0.0544,
+        "request_ttft_s_stats": {
+          "mean": 0.0544,
+          "std": 0.0,
+          "median": 0.0544,
+          "min": 0.0544,
+          "max": 0.0544,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.2653,
+        "e2e_from_request_s_stats": {
+          "mean": 18.2653,
+          "std": 0.0,
+          "median": 18.2653,
+          "min": 18.2653,
+          "max": 18.2653,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.3825,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.3825,
+          "std": 0.0,
+          "median": 18.3825,
+          "min": 18.3825,
+          "max": 18.3825,
+          "n": 1
+        },
+        "surgery_success_rate": 1.0,
+        "reconcile_path_counts": {
+          "surgery": 1
+        },
+        "boundary_values": [
+          19
+        ],
+        "last_surgery_profile": {
+          "success": true,
+          "reason": "ok",
+          "boundary": 19,
+          "seq_len": 497,
+          "num_blocks_needed": 32,
+          "available_blocks": 128,
+          "elapsed_ms": 62.78689205646515
+        },
+        "last_partial_recompute_profile": null,
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "origin": {
+        "source_fill_s": 0.0984,
+        "source_fill_s_stats": {
+          "mean": 0.0984,
+          "std": 0.0,
+          "median": 0.0984,
+          "min": 0.0984,
+          "max": 0.0984,
+          "n": 1
+        },
+        "prefetch_s": 17.9588,
+        "prefetch_s_stats": {
+          "mean": 17.9588,
+          "std": 0.0,
+          "median": 17.9588,
+          "min": 17.9588,
+          "max": 17.9588,
+          "n": 1
+        },
+        "activation_s": 0.238,
+        "activation_s_stats": {
+          "mean": 0.238,
+          "std": 0.0,
+          "median": 0.238,
+          "min": 0.238,
+          "max": 0.238,
+          "n": 1
+        },
+        "cache_invalidate_s": 0.0361,
+        "cache_invalidate_s_stats": {
+          "mean": 0.0361,
+          "std": 0.0,
+          "median": 0.0361,
+          "min": 0.0361,
+          "max": 0.0361,
+          "n": 1
+        },
+        "request_ttft_s": 0.1098,
+        "request_ttft_s_stats": {
+          "mean": 0.1098,
+          "std": 0.0,
+          "median": 0.1098,
+          "min": 0.1098,
+          "max": 0.1098,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.3428,
+        "e2e_from_request_s_stats": {
+          "mean": 18.3428,
+          "std": 0.0,
+          "median": 18.3428,
+          "min": 18.3428,
+          "max": 18.3428,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.4412,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.4412,
+          "std": 0.0,
+          "median": 18.4412,
+          "min": 18.4412,
+          "max": 18.4412,
+          "n": 1
+        },
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "request_only_speedup_ratio": 2.02,
+      "e2e_speedup_ratio": 1.0,
+      "source_fill_inclusive_speedup_ratio": 1.0,
+      "request_only_savings_s": 0.0554,
+      "e2e_savings_s": 0.0775,
+      "source_fill_inclusive_savings_s": 0.0587,
+      "partial_runs": [
+        {
+          "skip": false,
+          "branch": "partial",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.909945,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 500,
+          "actual_T": 496,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 515,
+          "source_fill_s": 0.117143,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 17.883873,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.05183088220655918,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.678774556145072,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.242445,
+          "sync_s": 0.00336,
+          "reconcile_s": 0.081081,
+          "request_ttft_s": 0.054398,
+          "e2e_from_request_s": 18.265334,
+          "e2e_from_source_fill_s": 18.382477,
+          "surgery_ok": true,
+          "boundary": 19,
+          "reconcile_path": "surgery",
+          "surgery_profile": {
+            "success": true,
+            "reason": "ok",
+            "boundary": 19,
+            "seq_len": 497,
+            "num_blocks_needed": 32,
+            "available_blocks": 128,
+            "elapsed_ms": 62.78689205646515
+          },
+          "partial_recompute_profile": null,
+          "kv_cache_gb_theoretical": 0.269,
+          "cpu_mem_gb": 8.191,
+          "gpu_mem_gb": 32.736
+        }
+      ],
+      "origin_runs": [
+        {
+          "skip": false,
+          "branch": "origin",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.828919,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 500,
+          "actual_T": 496,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 515,
+          "source_fill_s": 0.098419,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 17.958799,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.04985732398927212,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.75338372774422,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.23803,
+          "cache_invalidate_s": 0.036091,
+          "request_ttft_s": 0.109797,
+          "e2e_from_request_s": 18.342781,
+          "e2e_from_source_fill_s": 18.4412,
+          "kv_cache_gb_theoretical": 0.269,
+          "cpu_mem_gb": 8.157,
+          "gpu_mem_gb": 32.542
+        }
+      ]
+    },
+    {
+      "target_T": 1000,
+      "actual_T": 991,
+      "cache_condition": "cold",
+      "strict_partial_path": true,
+      "n_Q_tokens": 19,
+      "n_total_tokens": 1010,
+      "kv_cache_gb_theoretical": 0.537,
+      "partial": {
+        "source_fill_s": 0.1559,
+        "source_fill_s_stats": {
+          "mean": 0.1559,
+          "std": 0.0,
+          "median": 0.1559,
+          "min": 0.1559,
+          "max": 0.1559,
+          "n": 1
+        },
+        "prefetch_s": 17.9796,
+        "prefetch_s_stats": {
+          "mean": 17.9796,
+          "std": 0.0,
+          "median": 17.9796,
+          "min": 17.9796,
+          "max": 17.9796,
+          "n": 1
+        },
+        "activation_s": 0.2391,
+        "activation_s_stats": {
+          "mean": 0.2391,
+          "std": 0.0,
+          "median": 0.2391,
+          "min": 0.2391,
+          "max": 0.2391,
+          "n": 1
+        },
+        "sync_s": 0.0124,
+        "sync_s_stats": {
+          "mean": 0.0124,
+          "std": 0.0,
+          "median": 0.0124,
+          "min": 0.0124,
+          "max": 0.0124,
+          "n": 1
+        },
+        "reconcile_s": 0.1027,
+        "reconcile_s_stats": {
+          "mean": 0.1027,
+          "std": 0.0,
+          "median": 0.1027,
+          "min": 0.1027,
+          "max": 0.1027,
+          "n": 1
+        },
+        "request_ttft_s": 0.0524,
+        "request_ttft_s_stats": {
+          "mean": 0.0524,
+          "std": 0.0,
+          "median": 0.0524,
+          "min": 0.0524,
+          "max": 0.0524,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.3864,
+        "e2e_from_request_s_stats": {
+          "mean": 18.3864,
+          "std": 0.0,
+          "median": 18.3864,
+          "min": 18.3864,
+          "max": 18.3864,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.5423,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.5423,
+          "std": 0.0,
+          "median": 18.5423,
+          "min": 18.5423,
+          "max": 18.5423,
+          "n": 1
+        },
+        "surgery_success_rate": 1.0,
+        "reconcile_path_counts": {
+          "surgery": 1
+        },
+        "boundary_values": [
+          19
+        ],
+        "last_surgery_profile": {
+          "success": true,
+          "reason": "ok",
+          "boundary": 19,
+          "seq_len": 992,
+          "num_blocks_needed": 62,
+          "available_blocks": 128,
+          "elapsed_ms": 59.58952754735947
+        },
+        "last_partial_recompute_profile": null,
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "origin": {
+        "source_fill_s": 0.1587,
+        "source_fill_s_stats": {
+          "mean": 0.1587,
+          "std": 0.0,
+          "median": 0.1587,
+          "min": 0.1587,
+          "max": 0.1587,
+          "n": 1
+        },
+        "prefetch_s": 17.9601,
+        "prefetch_s_stats": {
+          "mean": 17.9601,
+          "std": 0.0,
+          "median": 17.9601,
+          "min": 17.9601,
+          "max": 17.9601,
+          "n": 1
+        },
+        "activation_s": 0.2442,
+        "activation_s_stats": {
+          "mean": 0.2442,
+          "std": 0.0,
+          "median": 0.2442,
+          "min": 0.2442,
+          "max": 0.2442,
+          "n": 1
+        },
+        "cache_invalidate_s": 0.0354,
+        "cache_invalidate_s_stats": {
+          "mean": 0.0354,
+          "std": 0.0,
+          "median": 0.0354,
+          "min": 0.0354,
+          "max": 0.0354,
+          "n": 1
+        },
+        "request_ttft_s": 0.1564,
+        "request_ttft_s_stats": {
+          "mean": 0.1564,
+          "std": 0.0,
+          "median": 0.1564,
+          "min": 0.1564,
+          "max": 0.1564,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.3961,
+        "e2e_from_request_s_stats": {
+          "mean": 18.3961,
+          "std": 0.0,
+          "median": 18.3961,
+          "min": 18.3961,
+          "max": 18.3961,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.5548,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.5548,
+          "std": 0.0,
+          "median": 18.5548,
+          "min": 18.5548,
+          "max": 18.5548,
+          "n": 1
+        },
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "request_only_speedup_ratio": 2.98,
+      "e2e_speedup_ratio": 1.0,
+      "source_fill_inclusive_speedup_ratio": 1.0,
+      "request_only_savings_s": 0.104,
+      "e2e_savings_s": 0.0097,
+      "source_fill_inclusive_savings_s": 0.0125,
+      "partial_runs": [
+        {
+          "skip": false,
+          "branch": "partial",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.286431,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 1000,
+          "actual_T": 991,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 1010,
+          "source_fill_s": 0.155923,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 17.97965,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.0503073763102293,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.792674398049712,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.239053,
+          "sync_s": 0.012427,
+          "reconcile_s": 0.102674,
+          "request_ttft_s": 0.05243,
+          "e2e_from_request_s": 18.386386,
+          "e2e_from_source_fill_s": 18.542309,
+          "surgery_ok": true,
+          "boundary": 19,
+          "reconcile_path": "surgery",
+          "surgery_profile": {
+            "success": true,
+            "reason": "ok",
+            "boundary": 19,
+            "seq_len": 992,
+            "num_blocks_needed": 62,
+            "available_blocks": 128,
+            "elapsed_ms": 59.58952754735947
+          },
+          "partial_recompute_profile": null,
+          "kv_cache_gb_theoretical": 0.537,
+          "cpu_mem_gb": 8.179,
+          "gpu_mem_gb": 32.928
+        }
+      ],
+      "origin_runs": [
+        {
+          "skip": false,
+          "branch": "origin",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.260393,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 1000,
+          "actual_T": 991,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 1010,
+          "source_fill_s": 0.158678,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 70,
+          "prefetch_s": 17.960056,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.05396016873419285,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.796316299587488,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.244192,
+          "cache_invalidate_s": 0.03542,
+          "request_ttft_s": 0.156382,
+          "e2e_from_request_s": 18.396115,
+          "e2e_from_source_fill_s": 18.554793,
+          "kv_cache_gb_theoretical": 0.537,
+          "cpu_mem_gb": 8.152,
+          "gpu_mem_gb": 32.542
+        }
+      ]
+    },
+    {
+      "target_T": 1500,
+      "actual_T": 1487,
+      "cache_condition": "cold",
+      "strict_partial_path": true,
+      "n_Q_tokens": 19,
+      "n_total_tokens": 1506,
+      "kv_cache_gb_theoretical": 0.806,
+      "partial": {
+        "source_fill_s": 0.2291,
+        "source_fill_s_stats": {
+          "mean": 0.2291,
+          "std": 0.0,
+          "median": 0.2291,
+          "min": 0.2291,
+          "max": 0.2291,
+          "n": 1
+        },
+        "prefetch_s": 17.7733,
+        "prefetch_s_stats": {
+          "mean": 17.7733,
+          "std": 0.0,
+          "median": 17.7733,
+          "min": 17.7733,
+          "max": 17.7733,
+          "n": 1
+        },
+        "activation_s": 0.2601,
+        "activation_s_stats": {
+          "mean": 0.2601,
+          "std": 0.0,
+          "median": 0.2601,
+          "min": 0.2601,
+          "max": 0.2601,
+          "n": 1
+        },
+        "sync_s": 0.0094,
+        "sync_s_stats": {
+          "mean": 0.0094,
+          "std": 0.0,
+          "median": 0.0094,
+          "min": 0.0094,
+          "max": 0.0094,
+          "n": 1
+        },
+        "reconcile_s": 0.1239,
+        "reconcile_s_stats": {
+          "mean": 0.1239,
+          "std": 0.0,
+          "median": 0.1239,
+          "min": 0.1239,
+          "max": 0.1239,
+          "n": 1
+        },
+        "request_ttft_s": 0.0595,
+        "request_ttft_s_stats": {
+          "mean": 0.0595,
+          "std": 0.0,
+          "median": 0.0595,
+          "min": 0.0595,
+          "max": 0.0595,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.2264,
+        "e2e_from_request_s_stats": {
+          "mean": 18.2264,
+          "std": 0.0,
+          "median": 18.2264,
+          "min": 18.2264,
+          "max": 18.2264,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.4555,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.4555,
+          "std": 0.0,
+          "median": 18.4555,
+          "min": 18.4555,
+          "max": 18.4555,
+          "n": 1
+        },
+        "surgery_success_rate": 1.0,
+        "reconcile_path_counts": {
+          "surgery": 1
+        },
+        "boundary_values": [
+          19
+        ],
+        "last_surgery_profile": {
+          "success": true,
+          "reason": "ok",
+          "boundary": 19,
+          "seq_len": 1488,
+          "num_blocks_needed": 93,
+          "available_blocks": 128,
+          "elapsed_ms": 55.82314729690552
+        },
+        "last_partial_recompute_profile": null,
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "origin": {
+        "source_fill_s": 0.23,
+        "source_fill_s_stats": {
+          "mean": 0.23,
+          "std": 0.0,
+          "median": 0.23,
+          "min": 0.23,
+          "max": 0.23,
+          "n": 1
+        },
+        "prefetch_s": 18.0241,
+        "prefetch_s_stats": {
+          "mean": 18.0241,
+          "std": 0.0,
+          "median": 18.0241,
+          "min": 18.0241,
+          "max": 18.0241,
+          "n": 1
+        },
+        "activation_s": 0.2373,
+        "activation_s_stats": {
+          "mean": 0.2373,
+          "std": 0.0,
+          "median": 0.2373,
+          "min": 0.2373,
+          "max": 0.2373,
+          "n": 1
+        },
+        "cache_invalidate_s": 0.0333,
+        "cache_invalidate_s_stats": {
+          "mean": 0.0333,
+          "std": 0.0,
+          "median": 0.0333,
+          "min": 0.0333,
+          "max": 0.0333,
+          "n": 1
+        },
+        "request_ttft_s": 0.2328,
+        "request_ttft_s_stats": {
+          "mean": 0.2328,
+          "std": 0.0,
+          "median": 0.2328,
+          "min": 0.2328,
+          "max": 0.2328,
+          "n": 1
+        },
+        "e2e_from_request_s": 18.5275,
+        "e2e_from_request_s_stats": {
+          "mean": 18.5275,
+          "std": 0.0,
+          "median": 18.5275,
+          "min": 18.5275,
+          "max": 18.5275,
+          "n": 1
+        },
+        "e2e_from_source_fill_s": 18.7576,
+        "e2e_from_source_fill_s_stats": {
+          "mean": 18.7576,
+          "std": 0.0,
+          "median": 18.7576,
+          "min": 18.7576,
+          "max": 18.7576,
+          "n": 1
+        },
+        "drop_caches_all_ok": true,
+        "warm_cache_all_ok": true,
+        "cache_prepare_all_ok": true
+      },
+      "request_only_speedup_ratio": 3.91,
+      "e2e_speedup_ratio": 1.02,
+      "source_fill_inclusive_speedup_ratio": 1.02,
+      "request_only_savings_s": 0.1733,
+      "e2e_savings_s": 0.3011,
+      "source_fill_inclusive_savings_s": 0.3021,
+      "partial_runs": [
+        {
+          "skip": false,
+          "branch": "partial",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.336464,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 1500,
+          "actual_T": 1487,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 1506,
+          "source_fill_s": 0.229117,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 71,
+          "prefetch_s": 17.773294,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.050583260133862495,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.605237716808915,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.260134,
+          "sync_s": 0.009372,
+          "reconcile_s": 0.123936,
+          "request_ttft_s": 0.059504,
+          "e2e_from_request_s": 18.226398,
+          "e2e_from_source_fill_s": 18.455515,
+          "surgery_ok": true,
+          "boundary": 19,
+          "reconcile_path": "surgery",
+          "surgery_profile": {
+            "success": true,
+            "reason": "ok",
+            "boundary": 19,
+            "seq_len": 1488,
+            "num_blocks_needed": 93,
+            "available_blocks": 128,
+            "elapsed_ms": 55.82314729690552
+          },
+          "partial_recompute_profile": null,
+          "kv_cache_gb_theoretical": 0.806,
+          "cpu_mem_gb": 8.188,
+          "gpu_mem_gb": 33.121
+        }
+      ],
+      "origin_runs": [
+        {
+          "skip": false,
+          "branch": "origin",
+          "model": "falcon-7b",
+          "stage": "1to2",
+          "cache_condition": "cold",
+          "strict_partial_path": true,
+          "cache_prepare_method": "drop_caches",
+          "cache_prepare_ok": true,
+          "cache_prepare_s": 5.362668,
+          "drop_caches_timeout_s": 60.0,
+          "run_index": 0,
+          "target_T": 1500,
+          "actual_T": 1487,
+          "n_Q_tokens": 19,
+          "n_total_tokens": 1506,
+          "source_fill_s": 0.230025,
+          "progressive_impl": "progressive_serve5",
+          "progressive_impl_path": "/home/devewha/K_Chatbot_v0.8.0/K_Chatbot_v0.8.0/progressive_serve5",
+          "progressive_path": "/acpl-ssd32/falcon-7b/final_merged/A_merged",
+          "max_model_len": 2048,
+          "gpu_memory_utilization_requested": 0.7,
+          "gpu_memory_utilization_effective": 0.7,
+          "gpu_memory_utilization_clamped": false,
+          "gpu_free_mem_before_load_gb": 47.168,
+          "gpu_total_mem_before_load_gb": 47.431,
+          "gpu_memory_reserve_gb": 1.0,
+          "tensor_parallel_size_effective": 1,
+          "trust_remote_code": false,
+          "enable_prefix_caching": true,
+          "drop_caches_requested": true,
+          "drop_caches_ok": true,
+          "warm_cache_requested": false,
+          "warm_cache_ok": true,
+          "gpu_temp_c_start": 70,
+          "prefetch_s": 18.024129,
+          "prefetch_status": {
+            "started": true,
+            "ready": true,
+            "in_progress": false,
+            "checkpoint_path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+            "layer_indices": [
+              19,
+              20,
+              21,
+              22
+            ],
+            "prefetch_profile": {
+              "path": "/acpl-ssd32/falcon-7b/final_merged/stage2_layers_B.safetensors",
+              "tensor_count": 24,
+              "load_file_s": 0.051816731691360474,
+              "pin_memory": {
+                "enabled": true,
+                "pin_time_s": 17.850863782688975,
+                "pinned_count": 24,
+                "already_pinned_count": 0,
+                "failed_count": 0,
+                "skipped_non_tensor_count": 0,
+                "pinned_bytes": 1656560640,
+                "pinned_mb": 1579.8193359375
+              }
+            }
+          },
+          "activation_s": 0.23728,
+          "cache_invalidate_s": 0.033259,
+          "request_ttft_s": 0.232813,
+          "e2e_from_request_s": 18.527543,
+          "e2e_from_source_fill_s": 18.757569,
+          "kv_cache_gb_theoretical": 0.806,
+          "cpu_mem_gb": 8.17,
+          "gpu_mem_gb": 32.542
+        }
+      ]
+    }
+  ]
+}

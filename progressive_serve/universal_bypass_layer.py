@@ -1,13 +1,16 @@
 """
-Universal Bypass Layer - base layer를 alpha 값과 함께 감싸는 wrapper.
+Universal Bypass Layer - Simple Wrapper (CUDA Graph Safe)
+progressive_serve/universal_bypass_layer.py
 
-forward는 base layer를 그대로 호출하고, two-path blending
-(alpha * Path_A + (1-alpha) * Path_B)은 모델의 forward 루프에서 처리.
-CUDA Graph 호환: forward에서 .item() 호출 없음, alpha는 in-place fill_()로만 업데이트.
+✅ 단순 wrapper (alpha 관리만)
+✅ Forward는 base layer 그대로 호출
+✅ Two-path blending은 모델 forward에서 처리
+✅ CUDA Graph compatible: No .item() calls in forward!
 """
 
 import torch
 import torch.nn as nn
+import os
 from typing import Optional
 
 
@@ -49,6 +52,9 @@ class UniversalBypassLayer(nn.Module):
         # Alpha buffer (CUDA Graph safe)
         # register_buffer ensures it's on GPU and tracked by module
         self.register_buffer('alpha', torch.tensor(initial_alpha))
+        self._alpha_update_mode = os.environ.get("P2_ALPHA_UPDATE_MODE", "inplace").strip().lower()
+        if self._alpha_update_mode not in ("inplace", "rebind"):
+            self._alpha_update_mode = "inplace"
         
         # State tracking (Python bool, not tensor - safe for conditional logic)
         self._is_active = initial_alpha > 0.5
@@ -67,7 +73,10 @@ class UniversalBypassLayer(nn.Module):
     
     def activate(self):
         """레이어 활성화 (alpha = 1.0)"""
-        self.alpha.fill_(1.0)
+        if self._alpha_update_mode == "rebind":
+            self.alpha = torch.tensor(1.0, device=self.alpha.device, dtype=self.alpha.dtype)
+        else:
+            self.alpha.fill_(1.0)
         self._is_active = True
         if self.layer_idx is not None:
             # ✅ SAFE: .item() only during non-forward operations
@@ -75,14 +84,20 @@ class UniversalBypassLayer(nn.Module):
     
     def deactivate(self):
         """레이어 비활성화 (alpha = 0.0)"""
-        self.alpha.fill_(0.0)
+        if self._alpha_update_mode == "rebind":
+            self.alpha = torch.tensor(0.0, device=self.alpha.device, dtype=self.alpha.dtype)
+        else:
+            self.alpha.fill_(0.0)
         self._is_active = False
         if self.layer_idx is not None:
             print(f"⊗ Layer {self.layer_idx} deactivated (alpha={self.alpha.item():.1f} → BYPASS path)")
     
     def set_alpha(self, value: float):
         """Alpha 값 직접 설정"""
-        self.alpha.fill_(value)
+        if self._alpha_update_mode == "rebind":
+            self.alpha = torch.tensor(float(value), device=self.alpha.device, dtype=self.alpha.dtype)
+        else:
+            self.alpha.fill_(value)
         self._is_active = value > 0.5
     
     def is_active(self) -> bool:
@@ -90,13 +105,29 @@ class UniversalBypassLayer(nn.Module):
         return self._is_active
     
     def get_alpha(self) -> torch.Tensor:
-        """alpha 값을 tensor로 반환. forward 루프에서 사용 (CUDA Graph safe)."""
+        """
+        현재 alpha 값 (tensor 반환)
+        
+        CUDA Graph Compatibility:
+        - Returns tensor, not float!
+        - No .item() call during forward pass
+        - Use this in forward loops
+        
+        Returns:
+            torch.Tensor: Alpha value as 0-d tensor (scalar)
+        """
         return self.alpha
-
+    
     def get_alpha_value(self) -> float:
         """
-        alpha 값을 float으로 반환.
-        WARNING: CUDA Graph 캡처 중 사용 금지. 로깅/상태 출력에만 사용.
+        현재 alpha 값 (float 반환)
+        
+        WARNING: Only use outside of CUDA Graph capture!
+        - For logging, debugging, status printing
+        - NOT for forward pass computations
+        
+        Returns:
+            float: Alpha value as Python float
         """
         return self.alpha.item()
     

@@ -24,16 +24,16 @@ Usage:
   Stage 2: 3턴, 각 ~80 토큰 → 전환 시점 ~900 토큰 누적
   Stage 3: 3턴, 각 ~80 토큰 → ~1200 토큰 누적 (4096 이내)
 
-측정 항목:
-  [Origin]  t_prefetch | t_activation | t_cache_clear
-            → t_total_transition (빠름)
-            → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
-            → t_total_effective = transition + first_chat
+  측정 항목:
+    [Origin]  t_prefetch | t_activation | t_cache_clear
+             → t_total_transition (빠름)
+             → t_first_chat  ← 여기서 FULL PREFILL 발생 (느림)
+             → t_total_effective = transition + first_chat
 
-  [Partial] t_sync | t_prefetch | t_activation | t_skbi (~20ms, Selective KV Block Injection (SKBI))
-            → t_total_transition (sync+SKBI 포함, 빠름)
-            → t_first_chat  ← KV 이미 업데이트됨, prefix cache 유지 (빠름)
-            → t_total_effective = transition + first_chat
+    [Partial] t_sync | t_prefetch | t_activation | t_reconcile
+             → t_total_transition (sync+surgery 포함, 빠름)
+             → t_first_chat  ← KV 이미 업데이트됨, prefix cache 유지 (빠름)
+             → t_total_effective = transition + first_chat
 
 핵심: t_total_effective 가 진짜 사용자 체감 비용
 """
@@ -437,9 +437,9 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
                                  conversation, sampling_params,
                                  first_prompt):
     """
-    Partial 모드 stage 전환 타이밍 측정 (Selective KV Block Injection (SKBI)).
+    Partial 모드 stage 전환 타이밍 측정 (KV block surgery).
 
-    단계: sync → prefetch → activation → Selective KV Block Injection (SKBI) (~20ms)
+    단계: sync → prefetch → activation → KV block surgery (~20ms)
     이후: 첫 채팅 (prefix cache 유지 → prefill 스킵 → 빠름)
     """
     tr = {}
@@ -458,17 +458,17 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     tr["gpu_allocated_before_gb"]  = round(gpu_mem_gb(), 3)
     tr["gpu_reserved_before_gb"]   = round(gpu_reserved_gb(), 3)
 
-    # t_sync: GPU persistent buffer → _layer_output_cache (SKBI fallback용)
+    # t_sync: GPU persistent buffer → _layer_output_cache (surgery fallback용)
     torch.cuda.synchronize()
     t0 = time.time()
     inner_model = getattr(model, "model", None)
     if inner_model is not None and hasattr(inner_model, "sync_persistent_cache"):
         seq_len = 0
-        if (getattr(inner_model, "_skbi_seq_lens_tensor", None) is not None
-                and inner_model._skbi_seq_lens_tensor.numel() > 0):
-            seq_len = int(inner_model._skbi_seq_lens_tensor[0].item())
+        seq_tensor = getattr(inner_model, "_surgery_seq_lens_tensor", None)
+        if seq_tensor is not None and seq_tensor.numel() > 0:
+            seq_len = int(seq_tensor[0].item())
         if seq_len > 0:
-            print(f"    → [Sync] Caching {seq_len} tokens for SKBI fallback...")
+            print(f"    → [Sync] Caching {seq_len} tokens for surgery fallback...")
             inner_model.sync_persistent_cache(seq_len)
     torch.cuda.synchronize()
     tr["t_sync_s"] = round(time.time() - t0, 3)
@@ -506,21 +506,22 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
     tr["gpu_reserved_after_activation_gb"]  = round(gpu_reserved_gb(), 3)
     tr["gpu_peak_allocated_activation_gb"]  = round(gpu_peak_allocated_gb(), 3)
 
-    # t_skbi: Selective KV Block Injection (SKBI)
+    # t_reconcile: KV block surgery
     torch.cuda.synchronize()
     t0 = time.time()
-    skbi_ok = False
+    surgery_ok = False
     if (hasattr(model, "get_recompute_boundary")
             and hasattr(model, get_indices_fn_name)
             and hasattr(model, "model")):
         indices = getattr(model, get_indices_fn_name)()
         boundary = model.get_recompute_boundary(indices)
         if boundary is not None:
-            skbi_ok = model.model.apply_skbi(boundary=boundary)
+            if hasattr(model.model, "inject_upper_layer_kv"):
+                surgery_ok = model.model.inject_upper_layer_kv(boundary=boundary)
 
-    if not skbi_ok:
+    if not surgery_ok:
         # Fallback: prefix cache 초기화 후 full prefill
-        print("    → [SKBI] fallback: reset_prefix_cache + full prefill")
+        print("    → [Surgery] fallback: reset_prefix_cache + full prefill")
         minimal_params = SamplingParams(temperature=0.0, max_tokens=1)
         if len(conversation) > 0:
             prompt_now = build_prompt(tokenizer, conversation)
@@ -528,31 +529,31 @@ def _measure_transition_partial(llm, model, tokenizer, config, stage_key,
             llm.generate([prompt_now], minimal_params)
 
     torch.cuda.synchronize()
-    tr["t_skbi_s"] = round(time.time() - t0, 3)
-    tr["skbi_ok"] = skbi_ok
-    tr["gpu_allocated_after_skbi_gb"] = round(gpu_mem_gb(), 3)
-    tr["gpu_reserved_after_skbi_gb"]  = round(gpu_reserved_gb(), 3)
+    tr["t_reconcile_s"] = round(time.time() - t0, 3)
+    tr["surgery_ok"] = surgery_ok
+    tr["gpu_allocated_after_surgery_gb"] = round(gpu_mem_gb(), 3)
+    tr["gpu_reserved_after_surgery_gb"]  = round(gpu_reserved_gb(), 3)
 
     tr["t_total_transition_s"] = round(
-        tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_skbi_s"], 3
+        tr["t_sync_s"] + tr["t_prefetch_s"] + tr["t_activation_s"] + tr["t_reconcile_s"], 3
     )
     tr["cpu_mem_after_transition_gb"]       = round(cpu_mem_gb(), 3)
     tr["gpu_allocated_after_transition_gb"] = round(gpu_mem_gb(), 3)
     tr["gpu_reserved_after_transition_gb"]  = round(gpu_reserved_gb(), 3)
 
-    status = "✅ SKBI" if skbi_ok else "⚠️ fallback(full prefill)"
+    status = "✅ surgery" if surgery_ok else "⚠️ fallback(full prefill)"
     print(f"    → t_sync={tr['t_sync_s']:.3f}s | "
           f"t_prefetch={tr['t_prefetch_s']:.3f}s | "
           f"t_activation={tr['t_activation_s']:.3f}s | "
-          f"t_skbi={tr['t_skbi_s']:.3f}s ({status}) | "
+          f"t_reconcile={tr['t_reconcile_s']:.3f}s ({status}) | "
           f"t_transition={tr['t_total_transition_s']:.3f}s")
     print(f"    → H2D bw={tr['h2d_bandwidth_gb_s']:.2f} GB/s | "
           f"CPU RAM peak={tr['prefetch_resources'].get('cpu_mem_peak_gb', '?'):.3f} GB | "
           f"CPU util={tr['prefetch_resources'].get('cpu_pct_mean', '?'):.1f}% avg")
-    cache_status = "preserved (prefix hit expected)" if skbi_ok else "cleared (full prefill)"
+    cache_status = "preserved (prefix hit expected)" if surgery_ok else "cleared (full prefill)"
     print(f"    → [First chat] prefix cache {cache_status}...")
 
-    # 첫 채팅 (SKBI 성공 시 → new user tokens만 처리, 매우 빠름)
+    # 첫 채팅 (surgery 성공 시 → new user tokens만 처리, 매우 빠름)
     r_first = do_chat(llm, tokenizer, conversation, first_prompt, sampling_params)
     tr["t_first_chat_s"]     = r_first["t_chat_s"]
     tr["first_chat_n_input"]  = r_first["n_input_tokens"]
@@ -907,10 +908,9 @@ def compare(path_a: str, path_b: str):
         vb_cc = tb.get("t_cache_clear_s", 0.0)
         print(fmt_row("  t_cache_clear [origin only]", va_cc, vb_cc))
 
-        # SKBI (partial only) — 구 결과의 t_recompute_s도 호환
-        va_rc = ta.get("t_skbi_s", ta.get("t_recompute_s", 0.0))
-        vb_rc = tb.get("t_skbi_s", tb.get("t_recompute_s", 0.0))
-        print(fmt_row("  t_skbi/recompute [partial only]", va_rc, vb_rc))
+        va_rc = ta.get("t_reconcile_s", 0.0)
+        vb_rc = tb.get("t_reconcile_s", 0.0)
+        print(fmt_row("  t_reconcile [partial only]", va_rc, vb_rc))
 
         print(fmt_row("  t_total_transition",
                       ta.get("t_total_transition_s"), tb.get("t_total_transition_s")))
@@ -1045,7 +1045,7 @@ def compare(path_a: str, path_b: str):
     print("\n  NOTE:")
     print("  - t_first_chat in Origin = FULL PREFILL (all tokens recomputed, slow)")
     print("  - t_first_chat in Partial = only new user tokens processed (fast, prefix cache hit)")
-    print("  - t_skbi in Partial = Selective KV Block Injection (SKBI): upper layers only (~20ms)")
+    print("  - t_reconcile in Partial = KV block surgery (~20ms)")
     print("    (lower layers KV untouched; prefix cache preserved → next generate skips prefill)")
     print("  - CPU RAM peak during prefetch = staging buffer size (pinned, partial only)")
     print("  - H2D bandwidth = ckpt_size_gb / t_activation_s")

@@ -1,0 +1,14 @@
+[
+  {
+    "model": "gemma-7b",
+    "display_name": "Gemma-7B",
+    "repair_oracle_B": null,
+    "stale_oracle_B": null,
+    "repair_oracle_C": null,
+    "stale_oracle_C": null,
+    "repair_cost_tmax_us_per_token": 214.02,
+    "fast_path_success_pct": 100.0,
+    "post_promo_gain_tmax_x": 4.09,
+    "tmax": 1483
+  }
+]

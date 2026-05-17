@@ -1,74 +1,178 @@
 {
   "mode": "origin",
   "model": "llama",
-  "t_load_s": 28.66,
-  "gpu_mem_after_load_gb": 18.381,
+  "t_load_s": 113.6,
+  "gpu_allocated_after_load_gb": 32.272,
+  "gpu_reserved_after_load_gb": 32.385,
+  "cpu_mem_after_load_gb": 5.293,
   "stage1_chats": [
     {
-      "question": "Tell me about the history of computing briefly.",
-      "t_chat_s": 5.706,
-      "n_input_tokens": 18,
-      "n_gen_tokens": 255,
-      "tokens_per_sec": 44.7,
-      "gpu_mem_gb": 18.381
+      "question": "Please provide an extremely comprehensive and detailed histo",
+      "t_chat_s": 0.165,
+      "n_input_tokens": 921,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 6.1,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.323
     },
     {
-      "question": "What were the key innovations of the 1970s in computing?",
-      "t_chat_s": 5.78,
-      "n_input_tokens": 299,
-      "n_gen_tokens": 255,
-      "tokens_per_sec": 44.1,
-      "gpu_mem_gb": 18.381
+      "question": "Provide a thorough and technically detailed account of the e",
+      "t_chat_s": 0.152,
+      "n_input_tokens": 1681,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 6.6,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.329
     },
     {
-      "question": "How did personal computers change society?",
-      "t_chat_s": 5.925,
-      "n_input_tokens": 570,
-      "n_gen_tokens": 255,
-      "tokens_per_sec": 43.0,
-      "gpu_mem_gb": 18.381
+      "question": "Describe in extensive technical depth the full evolution of ",
+      "t_chat_s": 0.139,
+      "n_input_tokens": 2423,
+      "n_gen_tokens": 2,
+      "tokens_per_sec": 14.4,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.33
+    },
+    {
+      "question": "What were the most significant innovations in operating syst",
+      "t_chat_s": 0.143,
+      "n_input_tokens": 3118,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 7.0,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.331
+    },
+    {
+      "question": "Analyze in complete technical depth the evolution of compute",
+      "t_chat_s": 0.148,
+      "n_input_tokens": 3853,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 6.7,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.332
+    },
+    {
+      "question": "How did the personal computer revolution of the 1970s and 19",
+      "t_chat_s": 0.16,
+      "n_input_tokens": 4629,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 6.2,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 32.523,
+      "cpu_mem_gb": 5.333
     }
   ],
   "stage1_to_2": {
-    "t_prefetch_s": 0.101,
-    "t_activation_s": 14.428,
-    "t_cache_clear_s": 0.0,
-    "t_total_transition_s": 14.529,
-    "gpu_mem_after_transition_gb": 18.381,
-    "t_first_chat_s": 5.969,
-    "first_chat_n_input": 842,
-    "first_chat_n_gen": 256,
-    "t_total_effective_s": 20.498
+    "ckpt_size_gb": 1.508,
+    "cpu_mem_before_gb": 5.333,
+    "gpu_allocated_before_gb": 32.272,
+    "gpu_reserved_before_gb": 32.523,
+    "t_prefetch_s": 0.103,
+    "prefetch_resources": {
+      "n_samples": 1,
+      "cpu_mem_peak_gb": 5.334,
+      "cpu_mem_mean_gb": 5.334,
+      "gpu_mem_peak_gb": 32.272,
+      "cpu_pct_mean": 0.0,
+      "cpu_pct_peak": 0.0
+    },
+    "cpu_mem_after_prefetch_gb": 5.335,
+    "t_activation_s": 14.821,
+    "h2d_bandwidth_gb_s": 0.1,
+    "gpu_allocated_after_activation_gb": 32.272,
+    "gpu_reserved_after_activation_gb": 32.785,
+    "gpu_peak_allocated_activation_gb": 32.44,
+    "t_cache_clear_s": 0.002,
+    "t_total_transition_s": 14.926,
+    "gpu_allocated_after_transition_gb": 32.272,
+    "gpu_reserved_after_transition_gb": 32.785,
+    "cpu_mem_after_transition_gb": 5.342,
+    "t_first_chat_s": 0.673,
+    "first_chat_n_input": 4728,
+    "first_chat_n_gen": 1,
+    "t_total_effective_s": 15.599,
+    "gpu_allocated_after_first_chat_gb": 32.272,
+    "gpu_reserved_after_first_chat_gb": 33.176
   },
   "stage2_chats": [
     {
-      "question": "Can you explain neural networks briefly?",
-      "t_chat_s": 6.046,
-      "n_input_tokens": 1114,
-      "n_gen_tokens": 256,
-      "tokens_per_sec": 42.3,
-      "gpu_mem_gb": 18.381
+      "question": "Explain the architecture and training process of transformer",
+      "t_chat_s": 0.064,
+      "n_input_tokens": 4833,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 15.6,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 33.182,
+      "cpu_mem_gb": 5.343
+    },
+    {
+      "question": "What are the major challenges in training large language mod",
+      "t_chat_s": 0.063,
+      "n_input_tokens": 4924,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 15.9,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 33.182,
+      "cpu_mem_gb": 5.344
     }
   ],
   "stage2_to_3": {
-    "t_prefetch_s": 0.1,
-    "t_activation_s": 14.536,
-    "t_cache_clear_s": 0.0,
-    "t_total_transition_s": 14.636,
-    "gpu_mem_after_transition_gb": 18.381,
-    "t_first_chat_s": 6.146,
-    "first_chat_n_input": 1387,
-    "first_chat_n_gen": 256,
-    "t_total_effective_s": 20.782
+    "ckpt_size_gb": 1.508,
+    "cpu_mem_before_gb": 5.344,
+    "gpu_allocated_before_gb": 32.272,
+    "gpu_reserved_before_gb": 33.182,
+    "t_prefetch_s": 0.102,
+    "prefetch_resources": {
+      "n_samples": 1,
+      "cpu_mem_peak_gb": 5.345,
+      "cpu_mem_mean_gb": 5.345,
+      "gpu_mem_peak_gb": 32.272,
+      "cpu_pct_mean": 0.0,
+      "cpu_pct_peak": 0.0
+    },
+    "cpu_mem_after_prefetch_gb": 5.345,
+    "t_activation_s": 14.799,
+    "h2d_bandwidth_gb_s": 0.1,
+    "gpu_allocated_after_activation_gb": 32.272,
+    "gpu_reserved_after_activation_gb": 33.182,
+    "gpu_peak_allocated_activation_gb": 32.44,
+    "t_cache_clear_s": 0.001,
+    "t_total_transition_s": 14.902,
+    "gpu_allocated_after_transition_gb": 32.272,
+    "gpu_reserved_after_transition_gb": 33.182,
+    "cpu_mem_after_transition_gb": 5.335,
+    "t_first_chat_s": 0.729,
+    "first_chat_n_input": 5032,
+    "first_chat_n_gen": 1,
+    "t_total_effective_s": 15.631,
+    "gpu_allocated_after_first_chat_gb": 32.272,
+    "gpu_reserved_after_first_chat_gb": 33.389
   },
   "stage3_chats": [
     {
-      "question": "How will AI affect employment in the next decade?",
-      "t_chat_s": 6.225,
-      "n_input_tokens": 1665,
-      "n_gen_tokens": 256,
-      "tokens_per_sec": 41.1,
-      "gpu_mem_gb": 18.381
+      "question": "How will AI automation affect employment across different se",
+      "t_chat_s": 0.064,
+      "n_input_tokens": 5143,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 15.5,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 33.389,
+      "cpu_mem_gb": 5.336
+    },
+    {
+      "question": "Discuss the geopolitical dimensions of the AI development ra",
+      "t_chat_s": 0.064,
+      "n_input_tokens": 5245,
+      "n_gen_tokens": 1,
+      "tokens_per_sec": 15.6,
+      "gpu_allocated_gb": 32.272,
+      "gpu_reserved_gb": 33.389,
+      "cpu_mem_gb": 5.337
     }
   ]
 }

@@ -1,0 +1,100 @@
+\subsection{Cache Correctness and Repair Cost}
+\label{sec:eval-kv}
+
+We finally evaluate whether ProgressiveServe's boundary-aware KV repair is both necessary for correctness and cheap enough to preserve user-visible responsiveness.
+This subsection focuses narrowly on the new KV-recomputation mechanism rather than on overall startup behavior.
+Our goal is to isolate the consequence of \emph{not} repairing stale post-promotion KV, and then measure how much latency ProgressiveServe recovers by rematerializing only the affected suffix.
+Figure~\ref{fig:kv-main} now shows as much of this story as the completed data supports: the left plot summarizes KV-correctness behavior across all four models and both promotions, while the middle and right plots use the completed LLaMA-2-7B origin-first runs to show the representative latency and repair-cost scaling for both Stage~\(1\!\rightarrow\!2\) and Stage~\(2\!\rightarrow\!3\).
+Table~\ref{tab:kv-summary} complements the figure with the exact cross-model ratios.
+
+\paragraph{Repair is necessary for correctness.}
+We first ask whether KV states produced before promotion can be reused unchanged after later layers become active.
+We use the lossless three-turn probe described in Section~\ref{sec:kv_reconcile}: the model processes span \(A\) at Stage~1, then we evaluate perplexity only on newly appended span \(B\) after the Stage~\(1\!\rightarrow\!2\) promotion and only on newly appended span \(C\) after the Stage~\(2\!\rightarrow\!3\) promotion.
+We compare three policies:
+\textit{Oracle-Recompute}, which fully recomputes the prefix under the promoted model;
+\textit{ProgressiveServe-Repair}, which preserves the unchanged prefix and recomputes only the suffix beyond the promotion point;
+and \textit{Stale-Reuse}, which reuses the pre-promotion KV state without repair.
+
+The left plot in Figure~\ref{fig:kv-main} shows that stale reuse is consistently unsafe across all four completed models.
+For the representative LLaMA-2-7B run, \textit{Stale-Reuse} increases perplexity by \(+9.31\%\) on \(B\) and \(+33.66\%\) on \(C\) relative to the oracle.
+In contrast, \textit{ProgressiveServe-Repair} stays within \(-0.90\%\) on \(B\) and \(+0.18\%\) on \(C\), effectively matching the oracle despite reusing the unchanged lower-prefix state.
+The same pattern generalizes across the full model set.
+LLaMA-2-13B remains within \(-0.81\%\) and \(+0.99\%\) of oracle after repair, while stale reuse degrades by \(+7.23\%\) and \(+14.19\%\).
+Falcon-7B remains within \(-1.35\%\) and \(+2.69\%\) after repair, while stale reuse degrades by \(+2.91\%\) and \(+30.24\%\).
+Gemma-7B remains within \(+0.37\%\) and \(+0.72\%\) of oracle after repair, while stale reuse degrades by \(+12.86\%\) and \(+30.76\%\).
+These gaps are too large to treat stale KV as a harmless approximation: once the model changes at promotion time, upper-layer KV must be repaired to recover semantically correct post-promotion state.
+
+\paragraph{Repair cost is bounded and substantially lower than full reset.}
+Correctness alone is not enough if repair simply pushes a full-prefix recomputation penalty onto the next user interaction.
+We therefore sweep accumulated prefix length \(T\) in the completed origin-first LLaMA-2-7B runs and compare \textit{ProgressiveServe-Repair} against a correctness-preserving \textit{Full-Reset} baseline that discards the prefix cache and lets the next request re-prefill under the promoted model.
+
+The middle plot in Figure~\ref{fig:kv-main} shows that \textit{Full-Reset} grows rapidly with prefix length for both promotions, while \textit{ProgressiveServe-Repair} stays nearly flat.
+For the representative Stage~\(1\!\rightarrow\!2\) transition, the first post-promotion request TTFT grows from \(65.1\)~ms to \(227.7\)~ms under \textit{Full-Reset} as \(T\) increases from \(200\) to \(1500\), whereas \textit{ProgressiveServe-Repair} stays between \(48.4\)~ms and \(56.7\)~ms over the same range.
+At the largest tested context, ProgressiveServe reduces the first post-promotion request TTFT from \(227.7\)~ms to \(56.7\)~ms, a \(4.02\times\) improvement.
+The right plot in Figure~\ref{fig:kv-main} shows the corresponding normalized repair overhead for both promotions.
+Even at \(T{=}1500\), the repair path remains bounded at \(95.75\)~\(\mu\)s/token with a \(100.0\%\) fast-path success rate.
+
+The later Stage~\(2\!\rightarrow\!3\) transition shows the same qualitative behavior.
+At \(T{=}1500\), ProgressiveServe reduces the first post-promotion request TTFT from \(228.5\)~ms to \(54.4\)~ms, a \(4.20\times\) improvement, while the normalized repair overhead is \(71.8\)~\(\mu\)s/token.
+The broader completed origin-first sweep shows the same trend on larger and different model families.
+At \(T_{\max}\), LLaMA-2-13B reduces the first post-promotion request TTFT from \(410.8\)~ms to \(89.1\)~ms at Stage~\(1\!\rightarrow\!2\) and from \(415.6\)~ms to \(89.0\)~ms at Stage~\(2\!\rightarrow\!3\), corresponding to \(4.61\times\) and \(4.67\times\) improvements with normalized repair overheads of \(137.45\) and \(109.04\)~\(\mu\)s/token, respectively.
+Gemma-7B similarly reduces TTFT from \(270.8\)~ms to \(66.2\)~ms at Stage~\(1\!\rightarrow\!2\) and from \(273.1\)~ms to \(65.3\)~ms at Stage~\(2\!\rightarrow\!3\), corresponding to \(4.09\times\) and \(4.18\times\) improvements with normalized repair overheads of \(214.02\) and \(199.02\)~\(\mu\)s/token.
+All completed origin-first timing runs maintain a \(100.0\%\) fast-path success rate.
+Thus, the repair mechanism does not merely preserve correctness; it also prevents promotion from manifesting as a long full-prefix stall on the next turn.
+
+\paragraph{Cross-model summary.}
+Table~\ref{tab:kv-summary} summarizes the completed four-model correctness sweep together with the currently completed post-promotion gain measurements.
+Across all four models, \textit{ProgressiveServe-Repair} remains close to the oracle while \textit{Stale-Reuse} consistently degrades perplexity, especially after the later Stage~\(2\!\rightarrow\!3\) promotion.
+The origin-first request-side gain sweep is now complete for LLaMA-2-7B, LLaMA-2-13B, and Gemma-7B, so Table~\ref{tab:kv-summary} fills those gain entries directly and leaves only Falcon-7B as \textit{?}.
+Normalized repair work is still reported in the text and in Figure~\ref{fig:kv-main}(right), but we omit it from the main table because it is an internal per-token work metric rather than a direct user-visible latency metric.
+This strengthens the main systems claim of this subsection: correctness requires targeted KV repair, and across the completed timing runs the request-side benefit remains around \(4\times\) at long prefixes.
+
+\paragraph{Takeaway.}
+Boundary-aware KV repair is not an optional optimization layered on top of progressive serving.
+Without repair, stale upper-layer KV measurably corrupts the post-promotion model state across all four models.
+With repair, ProgressiveServe recovers oracle-level correctness to within about \(1\%\) on both LLaMA variants and Gemma, and within \(2.69\%\) even on Falcon, while cutting the first post-promotion request latency by about \(4\times\) at long prefixes across all currently completed origin-first timing runs.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.32\textwidth]{kv_correctness.pdf}
+\includegraphics[width=0.32\textwidth]{kv_post_transition_ttft.pdf}
+\includegraphics[width=0.32\textwidth]{kv_repair_cost_scaling.pdf}
+\caption{
+KV-cache correctness and repair practicality.
+Left: cross-model KV correctness, normalized to \textit{Oracle-Recompute}, for the newly appended span \(B\) after Stage~\(1\!\rightarrow\!2\) and span \(C\) after Stage~\(2\!\rightarrow\!3\).
+\textit{Stale-Reuse} degrades substantially across all four models, while \textit{ProgressiveServe-Repair} remains near oracle.
+Middle: first post-promotion request TTFT versus accumulated prefix length \(T\) for the representative completed LLaMA-2-7B origin-first runs, shown separately for Stage~\(1\!\rightarrow\!2\) and Stage~\(2\!\rightarrow\!3\).
+Right: normalized repair overhead versus \(T\) for the same representative runs.
+Together, these results show that KV repair is both necessary for correctness across models and practical at serving time.
+}
+\label{fig:kv-main}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\caption{
+Cross-model summary of KV correctness and currently completed post-promotion gain measurements.
+\textit{ProgressiveServe-Repair} remains close to oracle, while \textit{Stale-Reuse} is consistently unsafe.
+Post-promotion gain entries are currently complete for LLaMA-2-7B, LLaMA-2-13B, and Gemma-7B; Falcon-7B remains pending.
+}
+\label{tab:kv-summary}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrr}
+\toprule
+Model
+& Repair/Oracle \(B\)
+& Stale/Oracle \(B\)
+& Repair/Oracle \(C\)
+& Stale/Oracle \(C\)
+& Post-promo gain @ \(T_{\max}\) \\
+& (\(\times\))
+& (\(\times\))
+& (\(\times\))
+& (\(\times\))
+& (\(\times\)) \\
+\midrule
+\input{figures/kv_summary_rows.tex}
+\bottomrule
+\end{tabular}
+\end{table*}

@@ -1,12 +1,27 @@
 """
-Progressive ForCausalLM (vLLM v0.8.0, v0 engine)
+Universal ProgressiveForCausalLM with Dual-Path Design
+vLLM v0.8.0 Compatible (v0 engine) - Supports All Decoder-Only Models
 
-모든 Decoder-only 모델 지원 (LLaMA, Mistral, Qwen2 등).
-prune_log.json 기반으로 stage별 inactive layers를 결정하고,
-ProgressiveModelDualPath를 통해 Dual-Path forward를 실행.
+✅ 모든 Decoder-only 모델 지원
+✅ Path A/B 둘 다 항상 계산 (CUDA Graph topology 불변)
+✅ Alpha로 경로 선택
+✅ prune_log.json 기반 자동 레이어 결정
+✅ v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
+
+<핵심 기능>
+_load_prune_log: 모델 폴더의 prune_log.json을 읽어서 "이번엔 몇 번 레이어를 끄고 시작할까?"를 결정
+
+load_weights: model_config.py의 정보를 이용해 체크포인트 파일에서 가중치를 읽어와 모델에 집어넣음.
+만약 꺼진 레이어(Inactive)라면 가중치를 0으로 채워 메모리를 아끼거나 초기화 이슈를 방지합니다.
+
+advance_to_stageX: 다음 단계로 넘어갈 때 필요한 추가 가중치 파일(Safetensors)을 로드하고, model.activate_layers를 호출
 """
 
 from typing import Optional, List, Iterable, Tuple, Any, Dict
+from contextlib import contextmanager
+from collections import defaultdict
+import os
+import time
 import torch
 import torch.nn as nn
 import sys
@@ -30,9 +45,28 @@ from progressive_model_dual_path import ProgressiveModelDualPath
 from model_config import get_model_type, get_weight_pattern
 
 
+@contextmanager
+def _nvtx_range(name: str):
+    active = False
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(name)
+            active = True
+        except Exception:
+            active = False
+    try:
+        yield
+    finally:
+        if active:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+
+
 class ProgressiveForCausalLM(nn.Module):
     """
-    ForCausalLM wrapper for progressive serving (vLLM v0.8.0, v0 engine).
+    Universal ForCausalLM wrapper with Dual-Path Design (vLLM v0.8.0, v0 engine)
 
     지원 모델:
     - LLaMA (1, 2, 3), CodeLlama, Vicuna, Alpaca
@@ -45,8 +79,11 @@ class ProgressiveForCausalLM(nn.Module):
     - DeepSeek (v1, v2)
     - Yi
 
-    Stage 전환:
-    prefetch_stage2/3() → wait_for_prefetch() → advance_to_stage2/3_instant()
+    핵심:
+    - Path A/B 둘 다 항상 계산
+    - Alpha로 경로 선택
+    - 완벽한 CUDA Graph safety
+    - v0 engine: compute_logits(hidden_states, sampling_metadata) + sample()
     """
     supports_multimodal = False
     supports_pooling = False 
@@ -110,12 +147,32 @@ class ProgressiveForCausalLM(nn.Module):
 
         # Inactive layer tracking (for weight loading)
         self.inactive_layer_indices = set(inactive_indices)
+        self._stage1_copy_profile_enabled = (
+            os.getenv("P2_STAGE1_COPY_PROFILE", "0") == "1"
+        )
+        self._stage1_io_touch_enabled = (
+            os.getenv("P2_STAGE1_IO_TOUCH", "1") == "1"
+        )
+        self._stage1_copy_profile_records: list[tuple] = []
+        try:
+            self._instant_streams = max(1, int(os.getenv("P2_INSTANT_STREAMS", "4")))
+        except Exception:
+            self._instant_streams = 4
+        self._disable_persistent_cache_writes = (
+            os.getenv("P2_DISABLE_PERSISTENT_CACHE_WRITES", "0") == "1"
+        )
+        if self._disable_persistent_cache_writes:
+            print("⚙️  Persistent cache writes disabled (P2_DISABLE_PERSISTENT_CACHE_WRITES=1)")
 
         # 초기 캐싱 범위 설정
         max_cacheable = self._get_max_cacheable_layer()
-        self.model._max_cacheable_layer = max_cacheable
-        if max_cacheable is not None:
-            print(f"✅ Initial cache limit: layers 0-{max_cacheable}")
+        if self._disable_persistent_cache_writes:
+            self.model._max_cacheable_layer = -1
+            print("✅ Initial cache limit: disabled")
+        else:
+            self.model._max_cacheable_layer = max_cacheable
+            if max_cacheable is not None:
+                print(f"✅ Initial cache limit: layers 0-{max_cacheable}")
         
         print(f"\n{'='*60}")
         print(f"ProgressiveForCausalLM (Universal, vLLM v0.8.0 v0 engine)")
@@ -131,6 +188,7 @@ class ProgressiveForCausalLM(nn.Module):
         print(f"Initially inactive layers: {sorted(inactive_indices)}")
         print(f"🎯 Dual-Path: Path A/B always computed")
         print(f"✅ CUDA Graph safe: Topology invariant")
+        print(f"⚙️ Instant activation streams: {self._instant_streams}")
         print(f"{'='*60}\n")
     
     def _load_prune_log(self, model_path: str) -> Optional[dict]:
@@ -260,6 +318,125 @@ class ProgressiveForCausalLM(nn.Module):
     # ============================================================
     # Weight Loading (Universal, vLLM v0.8.0 compatible)
     # ============================================================
+    def _run_profiled_weight_loader(
+        self,
+        tag: str,
+        param: torch.Tensor,
+        tensor: torch.Tensor,
+        weight_loader,
+    ) -> None:
+        if not self._stage1_copy_profile_enabled or not torch.cuda.is_available():
+            with _nvtx_range(tag):
+                with _nvtx_range("H2D:weight_loader_enqueue"):
+                    weight_loader(param, tensor)
+            return
+
+        stream = torch.cuda.current_stream()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        enqueue_t0 = time.perf_counter_ns()
+        with _nvtx_range(f"{tag}_h2d_enqueue"):
+            with _nvtx_range("H2D:weight_loader_enqueue"):
+                start_evt.record(stream)
+                weight_loader(param, tensor)
+                end_evt.record(stream)
+        enqueue_ns = time.perf_counter_ns() - enqueue_t0
+
+        src_is_cpu = (hasattr(tensor, "device") and tensor.device.type == "cpu")
+        src_is_pinned = bool(src_is_cpu and hasattr(tensor, "is_pinned")
+                             and tensor.is_pinned())
+        nbytes = int(tensor.numel() * tensor.element_size()) \
+            if hasattr(tensor, "numel") else 0
+        self._stage1_copy_profile_records.append(
+            (tag, start_evt, end_evt, enqueue_ns, nbytes, src_is_cpu, src_is_pinned)
+        )
+
+    def _stage1_touch_tensor_for_io(self, tensor: torch.Tensor) -> None:
+        if not self._stage1_io_touch_enabled:
+            return
+        if not hasattr(tensor, "device") or tensor.device.type != "cpu":
+            return
+        with _nvtx_range("IO:tensor_touch"):
+            try:
+                if tensor.numel() > 0:
+                    _ = tensor.view(-1)[0].item()
+            except Exception:
+                pass
+
+    def _finalize_stage1_copy_profile(self) -> None:
+        if (not self._stage1_copy_profile_enabled
+                or not self._stage1_copy_profile_records
+                or not torch.cuda.is_available()):
+            return
+
+        with _nvtx_range("p2_stage1_copy_profile_finalize"):
+            torch.cuda.synchronize()
+
+        agg = defaultdict(lambda: {
+            "calls": 0,
+            "enqueue_ns": 0,
+            "gpu_ms": 0.0,
+            "bytes": 0,
+            "cpu_src_calls": 0,
+            "pinned_src_calls": 0,
+        })
+        total = {
+            "calls": 0,
+            "enqueue_ns": 0,
+            "gpu_ms": 0.0,
+            "bytes": 0,
+            "cpu_src_calls": 0,
+            "pinned_src_calls": 0,
+        }
+
+        for tag, start_evt, end_evt, enqueue_ns, nbytes, src_is_cpu, src_is_pinned in \
+                self._stage1_copy_profile_records:
+            gpu_ms = float(start_evt.elapsed_time(end_evt))
+            stat = agg[tag]
+            stat["calls"] += 1
+            stat["enqueue_ns"] += enqueue_ns
+            stat["gpu_ms"] += gpu_ms
+            stat["bytes"] += nbytes
+            if src_is_cpu:
+                stat["cpu_src_calls"] += 1
+            if src_is_pinned:
+                stat["pinned_src_calls"] += 1
+
+            total["calls"] += 1
+            total["enqueue_ns"] += enqueue_ns
+            total["gpu_ms"] += gpu_ms
+            total["bytes"] += nbytes
+            if src_is_cpu:
+                total["cpu_src_calls"] += 1
+            if src_is_pinned:
+                total["pinned_src_calls"] += 1
+
+        def _gbps(byte_count: int, gpu_ms: float) -> float:
+            if gpu_ms <= 0.0:
+                return 0.0
+            return (byte_count / 1e9) / (gpu_ms / 1e3)
+
+        print("\n" + "=" * 60)
+        print("STAGE1 COPY PROFILE (enqueue vs GPU event)")
+        print("=" * 60)
+        print("tag | calls | bytes(GB) | enqueue(s) | gpu_event(s) | est_gpu_GB/s | cpu_src | pinned_src")
+        for tag, stat in sorted(agg.items(), key=lambda x: x[1]["bytes"], reverse=True):
+            print(
+                f"{tag} | {stat['calls']} | {stat['bytes']/1e9:.3f} | "
+                f"{stat['enqueue_ns']/1e9:.3f} | {stat['gpu_ms']/1e3:.3f} | "
+                f"{_gbps(stat['bytes'], stat['gpu_ms']):.3f} | "
+                f"{stat['cpu_src_calls']} | {stat['pinned_src_calls']}"
+            )
+        print("-" * 60)
+        print(
+            f"TOTAL | {total['calls']} | {total['bytes']/1e9:.3f} | "
+            f"{total['enqueue_ns']/1e9:.3f} | {total['gpu_ms']/1e3:.3f} | "
+            f"{_gbps(total['bytes'], total['gpu_ms']):.3f} | "
+            f"{total['cpu_src_calls']} | {total['pinned_src_calls']}"
+        )
+        print("=" * 60 + "\n")
+
+        self._stage1_copy_profile_records.clear()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """
@@ -274,8 +451,10 @@ class ProgressiveForCausalLM(nn.Module):
         
         # Convert iterator to dict for easier handling
         checkpoint_weights = {}
-        for name, tensor in weights:
-            checkpoint_weights[name] = tensor
+        with _nvtx_range("p2_stage1_checkpoint_collect_dict"):
+            with _nvtx_range("IO:checkpoint_iter"):
+                for name, tensor in weights:
+                    checkpoint_weights[name] = tensor
         
         print(f"Total weights in checkpoint: {len(checkpoint_weights)}")
         
@@ -289,71 +468,100 @@ class ProgressiveForCausalLM(nn.Module):
         
         loaded_keys = set()
         loaded_count = 0
+        self._stage1_copy_profile_records.clear()
         
         # Load weights
-        for param_name, param in params_dict.items():
-            # Option 1: Direct match
-            if param_name in checkpoint_weights:
-                weight_loader = getattr(param, "weight_loader",
-                                       lambda p, w: p.data.copy_(w))
-                weight_loader(param, checkpoint_weights[param_name])
-                loaded_keys.add(param_name)
-                loaded_count += 1
-                continue
-            
-            # Option 2: Match without .layer prefix (for wrapped layers)
-            alt_name = param_name.replace(".layer.", ".")
-            if alt_name in checkpoint_weights:
-                weight_loader = getattr(param, "weight_loader",
-                                       lambda p, w: p.data.copy_(w))
-                weight_loader(param, checkpoint_weights[alt_name])
-                loaded_keys.add(param_name)
-                loaded_count += 1
-                continue
-            
-            # Option 3: Fused QKV weights (범용)
-            if weight_pattern.qkv_fused_name and weight_pattern.qkv_fused_name in param_name:
-                qkv_loaded = self._load_qkv_weights(
-                    param, param_name, checkpoint_weights, weight_pattern
-                )
-                if qkv_loaded:
-                    loaded_keys.add(param_name)
-                    loaded_count += 1
-                    continue
-
-            # Option 4: Fused Gate-Up weights (범용)
-            if weight_pattern.mlp_fused_name and weight_pattern.mlp_fused_name in param_name:
-                mlp_loaded = self._load_mlp_weights(
-                    param, param_name, checkpoint_weights, weight_pattern
-                )
-                if mlp_loaded:
-                    loaded_keys.add(param_name)
-                    loaded_count += 1
-                    continue
-
-            # Option 5: Falcon HuggingFace 형식 변환
-            # vLLM param:    model.layers.N.layer.*   (ProgressiveModelDualPath 래핑)
-            # HF checkpoint: transformer.h.N.*         (Falcon 원본 형식)
-            if self.model_type == "falcon":
-                import re
-                falcon_name = re.sub(
-                    r'^model\.layers\.(\d+)\.layer\.',
-                    lambda m: f'transformer.h.{m.group(1)}.',
-                    param_name,
-                )
-                if falcon_name == param_name:
-                    # 레이어가 아닌 파라미터: embed_tokens, norm
-                    falcon_name = param_name \
-                        .replace("model.embed_tokens.", "transformer.word_embeddings.") \
-                        .replace("model.norm.", "transformer.ln_f.")
-                if falcon_name != param_name and falcon_name in checkpoint_weights:
+        with _nvtx_range("p2_stage1_param_scan_load"):
+            for param_name, param in params_dict.items():
+                # Option 1: Direct match
+                if param_name in checkpoint_weights:
                     weight_loader = getattr(param, "weight_loader",
                                            lambda p, w: p.data.copy_(w))
-                    weight_loader(param, checkpoint_weights[falcon_name])
+                    with _nvtx_range("p2_stage1_direct_fetch_tensor"):
+                        with _nvtx_range("IO:fetch_tensor"):
+                            src_tensor = checkpoint_weights[param_name]
+                            self._stage1_touch_tensor_for_io(src_tensor)
+                    self._run_profiled_weight_loader(
+                        "p2_stage1_direct_weight_loader",
+                        param,
+                        src_tensor,
+                        weight_loader,
+                    )
                     loaded_keys.add(param_name)
                     loaded_count += 1
                     continue
-        
+                
+                # Option 2: Match without .layer prefix (for wrapped layers)
+                alt_name = param_name.replace(".layer.", ".")
+                if alt_name in checkpoint_weights:
+                    weight_loader = getattr(param, "weight_loader",
+                                           lambda p, w: p.data.copy_(w))
+                    with _nvtx_range("p2_stage1_alt_fetch_tensor"):
+                        with _nvtx_range("IO:fetch_tensor"):
+                            src_tensor = checkpoint_weights[alt_name]
+                            self._stage1_touch_tensor_for_io(src_tensor)
+                    self._run_profiled_weight_loader(
+                        "p2_stage1_alt_weight_loader",
+                        param,
+                        src_tensor,
+                        weight_loader,
+                    )
+                    loaded_keys.add(param_name)
+                    loaded_count += 1
+                    continue
+                
+                # Option 3: Fused QKV weights (범용)
+                if weight_pattern.qkv_fused_name and weight_pattern.qkv_fused_name in param_name:
+                    qkv_loaded = self._load_qkv_weights(
+                        param, param_name, checkpoint_weights, weight_pattern
+                    )
+                    if qkv_loaded:
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
+                # Option 4: Fused Gate-Up weights (범용)
+                if weight_pattern.mlp_fused_name and weight_pattern.mlp_fused_name in param_name:
+                    mlp_loaded = self._load_mlp_weights(
+                        param, param_name, checkpoint_weights, weight_pattern
+                    )
+                    if mlp_loaded:
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
+                # Option 5: Falcon HuggingFace 형식 변환
+                # vLLM param:    model.layers.N.layer.*   (ProgressiveModelDualPath 래핑)
+                # HF checkpoint: transformer.h.N.*         (Falcon 원본 형식)
+                if self.model_type == "falcon":
+                    import re
+                    falcon_name = re.sub(
+                        r'^model\.layers\.(\d+)\.layer\.',
+                        lambda m: f'transformer.h.{m.group(1)}.',
+                        param_name,
+                    )
+                    if falcon_name == param_name:
+                        # 레이어가 아닌 파라미터: embed_tokens, norm
+                        falcon_name = param_name \
+                            .replace("model.embed_tokens.", "transformer.word_embeddings.") \
+                            .replace("model.norm.", "transformer.ln_f.")
+                    if falcon_name != param_name and falcon_name in checkpoint_weights:
+                        weight_loader = getattr(param, "weight_loader",
+                                               lambda p, w: p.data.copy_(w))
+                        with _nvtx_range("p2_stage1_falcon_remap_fetch_tensor"):
+                            with _nvtx_range("IO:fetch_tensor"):
+                                src_tensor = checkpoint_weights[falcon_name]
+                                self._stage1_touch_tensor_for_io(src_tensor)
+                        self._run_profiled_weight_loader(
+                            "p2_stage1_falcon_remap_weight_loader",
+                            param,
+                            src_tensor,
+                            weight_loader,
+                        )
+                        loaded_keys.add(param_name)
+                        loaded_count += 1
+                        continue
+
         # Missing weights 처리
         missing_keys = set(params_dict.keys()) - loaded_keys
         
@@ -398,6 +606,8 @@ class ProgressiveForCausalLM(nn.Module):
                         zero_initialized += 1
             
             print(f"✅ Initialized {zero_initialized} missing weights to ZERO")
+
+        self._finalize_stage1_copy_profile()
         
         print(f"\n{'='*60}")
         print(f"WEIGHT LOADING SUMMARY")
@@ -437,13 +647,21 @@ class ProgressiveForCausalLM(nn.Module):
         
         # Check if all weights exist
         if all(name in checkpoint_weights for name in weight_names):
-            qkv_weight = torch.cat([
-                checkpoint_weights[name] for name in weight_names
-            ], dim=0)
+            with _nvtx_range("p2_stage1_qkv_cpu_fuse_cat"):
+                with _nvtx_range("IO:cpu_fuse_cat"):
+                    qkv_weight = torch.cat([
+                        checkpoint_weights[name] for name in weight_names
+                    ], dim=0)
+                self._stage1_touch_tensor_for_io(qkv_weight)
             
             weight_loader = getattr(param, "weight_loader",
                                    lambda p, w: p.data.copy_(w))
-            weight_loader(param, qkv_weight)
+            self._run_profiled_weight_loader(
+                "p2_stage1_qkv_weight_loader",
+                param,
+                qkv_weight,
+                weight_loader,
+            )
             return True
         
         return False
@@ -473,13 +691,21 @@ class ProgressiveForCausalLM(nn.Module):
         
         # Check if all weights exist
         if all(name in checkpoint_weights for name in weight_names):
-            mlp_weight = torch.cat([
-                checkpoint_weights[name] for name in weight_names
-            ], dim=0)
+            with _nvtx_range("p2_stage1_mlp_cpu_fuse_cat"):
+                with _nvtx_range("IO:cpu_fuse_cat"):
+                    mlp_weight = torch.cat([
+                        checkpoint_weights[name] for name in weight_names
+                    ], dim=0)
+                self._stage1_touch_tensor_for_io(mlp_weight)
             
             weight_loader = getattr(param, "weight_loader",
                                    lambda p, w: p.data.copy_(w))
-            weight_loader(param, mlp_weight)
+            self._run_profiled_weight_loader(
+                "p2_stage1_mlp_weight_loader",
+                param,
+                mlp_weight,
+                weight_loader,
+            )
             return True
         
         return False
@@ -559,6 +785,7 @@ class ProgressiveForCausalLM(nn.Module):
         success = self.model.activate_layers_instant(
             b_indices,
             wait_if_needed=wait_if_needed,
+            num_streams=self._instant_streams,
         )
 
         if success:
@@ -567,9 +794,13 @@ class ProgressiveForCausalLM(nn.Module):
 
             # 캐싱 범위 설정 (Stage 3 boundary-1까지)
             max_cacheable = self._get_max_cacheable_layer()
-            self.model._max_cacheable_layer = max_cacheable
-            if max_cacheable is not None:
-                print(f"[Stage2] Caching layers 0-{max_cacheable} (Stage 3 준비)")
+            if self._disable_persistent_cache_writes:
+                self.model._max_cacheable_layer = -1
+                print("[Stage2] Caching disabled (persistent writes OFF)")
+            else:
+                self.model._max_cacheable_layer = max_cacheable
+                if max_cacheable is not None:
+                    print(f"[Stage2] Caching layers 0-{max_cacheable} (Stage 3 준비)")
 
             print(f"\n{'='*80}")
             print(f"NOW AT STAGE 2 (instant)")
@@ -590,6 +821,7 @@ class ProgressiveForCausalLM(nn.Module):
         success = self.model.activate_layers_instant(
             c_indices,
             wait_if_needed=wait_if_needed,
+            num_streams=self._instant_streams,
         )
 
         if success:
@@ -597,8 +829,12 @@ class ProgressiveForCausalLM(nn.Module):
             self.inactive_layer_indices = set()
 
             # 캐싱 범위 설정 (Stage 3는 모든 레이어)
-            self.model._max_cacheable_layer = None
-            print(f"[Stage3] Caching all layers (final stage)")
+            if self._disable_persistent_cache_writes:
+                self.model._max_cacheable_layer = -1
+                print("[Stage3] Caching disabled (persistent writes OFF)")
+            else:
+                self.model._max_cacheable_layer = None
+                print(f"[Stage3] Caching all layers (final stage)")
 
             print(f"\n{'='*80}")
             print(f"NOW AT STAGE 3 - FULL MODEL (instant)")
@@ -744,6 +980,21 @@ class ProgressiveForCausalLM(nn.Module):
             "inactive_layer_indices": report["inactive_layer_indices"],
             "prune_info": self.prune_info,
         }
+
+    def get_last_instant_activation_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_instant_activation_profile"):
+            return self.model.get_last_instant_activation_profile()
+        return None
+
+    def get_last_surgery_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_surgery_profile"):
+            return self.model.get_last_surgery_profile()
+        return None
+
+    def get_last_partial_recompute_profile(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self.model, "get_last_partial_recompute_profile"):
+            return self.model.get_last_partial_recompute_profile()
+        return None
     
     def get_layer_alphas(self) -> List[float]:
         """모든 레이어의 alpha 값 반환"""
